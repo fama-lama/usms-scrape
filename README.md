@@ -2,6 +2,9 @@
 
 This project scrapes your USMS Smart Meter dashboard data using Selenium WebDriver and optionally publishes updates to an MQTT broker. It runs continuously at configurable intervals.
 
+Only works for smart meters registered with https://www.usms.com.bn/smartmeter/index.html
+
+
 ---
 
 ## Features
