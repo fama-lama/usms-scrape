@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import WebDriverException
 
 try:
     import paho.mqtt.client as mqtt
@@ -25,7 +26,7 @@ selenium_host = os.getenv("SELENIUM_HOST", "localhost")
 selenium_port = os.getenv("SELENIUM_PORT", "4444")
 
 mqtt_broker = os.getenv("MQTT_BROKER")
-mqtt_port = os.getenv("MQTT_PORT")
+mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
 mqtt_username = os.getenv("MQTT_USERNAME")
 mqtt_password = os.getenv("MQTT_PASSWORD")
 scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "1800"))
@@ -38,16 +39,25 @@ topic_balance = "home/usms/remaining_balance"
 topic_polled = "home/usms/meter_last_polled"
 topic_lastrun = "home/usms/last_run"
 
-# Configure Selenium
+# Configure Selenium options
 chrome_options = Options()
 chrome_options.add_argument("--headless")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
 
-driver = webdriver.Remote(
-    command_executor=f"http://{selenium_host}:{selenium_port}/wd/hub",
-    options=chrome_options
-)
+def create_driver():
+    for _ in range(5):
+        try:
+            return webdriver.Remote(
+                command_executor=f"http://{selenium_host}:{selenium_port}/wd/hub",
+                options=chrome_options
+            )
+        except WebDriverException as e:
+            log.warning(f"Selenium not ready yet: {e}")
+            time.sleep(3)
+    raise RuntimeError("Selenium host not reachable after retries.")
+
+driver = create_driver()
 
 def is_logged_in():
     driver.get("https://www.usms.com.bn/SmartMeter/Home")
@@ -67,15 +77,19 @@ def login():
     driver.find_element(By.ID, "ASPxRoundPanel1_btnLogin").click()
     time.sleep(3)
 
+def safe_get_text(xpath):
+    try:
+        return driver.find_element(By.XPATH, xpath).text
+    except Exception as e:
+        log.warning(f"Failed to find element {xpath}: {e}")
+        return "N/A"
+
 def scrape_data():
     log.info("Scraping dashboard…")
     driver.get("https://www.usms.com.bn/SmartMeter/Home")
-    remaining_unit = driver.find_element(By.XPATH,
-        "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]").text
-    remaining_balance = driver.find_element(By.XPATH,
-        "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]").text
-    meter_last_polled = driver.find_element(By.XPATH,
-        "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]").text
+    remaining_unit = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
+    remaining_balance = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
+    meter_last_polled = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
     last_run = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
     log.info(f"Unit: {remaining_unit}, Balance: {remaining_balance}, Last Polled: {meter_last_polled}, Time: {last_run}")
@@ -89,7 +103,7 @@ def publish_mqtt(unit, balance, polled, run_time):
     try:
         client = mqtt.Client()
         client.username_pw_set(mqtt_username, mqtt_password)
-        client.connect(mqtt_broker, int(mqtt_port), 60)
+        client.connect(mqtt_broker, mqtt_port, 60)
 
         client.publish(topic_unit, unit)
         client.publish(topic_balance, balance)
@@ -101,13 +115,25 @@ def publish_mqtt(unit, balance, polled, run_time):
     except Exception as e:
         log.error(f"MQTT error: {e}")
 
-while True:
-    try:
-        if not is_logged_in():
-            login()
-        unit, balance, polled, run_time = scrape_data()
-        publish_mqtt(unit, balance, polled, run_time)
-    except Exception as e:
-        log.error(f"Error during cycle: {e}")
-    log.info(f"Sleeping {scrape_interval}s…")
-    time.sleep(scrape_interval)
+def print_summary(unit, balance, polled, run_time):
+    print("\n=== USMS Data Summary ===")
+    print(f"Remaining Unit    : {unit}")
+    print(f"Remaining Balance : {balance}")
+    print(f"Meter Last Polled : {polled}")
+    print(f"Last Run Time     : {run_time}")
+    print("========================\n")
+
+try:
+    while True:
+        try:
+            if not is_logged_in():
+                login()
+            unit, balance, polled, run_time = scrape_data()
+            publish_mqtt(unit, balance, polled, run_time)
+            print_summary(unit, balance, polled, run_time)
+        except Exception as e:
+            log.error(f"Error during cycle: {e}")
+        log.info(f"Sleeping {scrape_interval}s…")
+        time.sleep(scrape_interval)
+finally:
+    driver.quit()
