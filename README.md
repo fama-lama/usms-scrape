@@ -34,6 +34,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 
 ---
 
+
 ## MQTT Topics Published
 
 - `home/usms/remaining_unit` — Remaining units on your smart meter  
