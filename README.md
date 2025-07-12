@@ -97,6 +97,35 @@ networks: {}
 
 The scraper will run automatically, scrape your USMS data every SCRAPE_INTERVAL seconds, and publish to MQTT if configured.
 
+## Home Assistant sensors
+
+insert this code into your configuration.yaml
+
+```yaml
+mqtt:
+  sensor:
+    - name: USMS Remaining Unit
+      state_topic: home/usms/remaining_unit
+      value_template: "{{ value.split(' ')[0] }}"
+      unit_of_measurement: "kWh"
+      state_class: total
+
+    - name: USMS Remaining Balance
+      state_topic: home/usms/remaining_balance
+      value_template: "{{ value.replace('$', '') }}"
+      unit_of_measurement: "BND"
+      state_class: total
+ 
+    - name: USMS Meter Last Polled
+      state_topic: home/usms/meter_last_polled
+      value_template: "{{ value }}"
+
+
+    - name: USMS Last Run Time
+      state_topic: home/usms/last_run
+      value_template: "{{ value | as_datetime('%Y-%m-%d %H:%M:%S') }}"
+```
+
 ## Development
 
 The main scraper script is usms.py.
