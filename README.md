@@ -70,10 +70,10 @@ services:
       - USMS_PASSWORD=PASSWORD123! #CHANGE
       - SELENIUM_HOST=selenium 
       - SELENIUM_PORT=4444 
-      - MQTT_BROKER= #CHANGE
-      - MQTT_PORT= #CHANGE
-      - MQTT_USERNAME= #CHANGE
-      - MQTT_PASSWORD= #CHANGE
+      - MQTT_BROKER=x.x.x.x #CHANGE
+      - MQTT_PORT=1883 #CHANGE
+      - MQTT_USERNAME=mqttuser #CHANGE
+      - MQTT_PASSWORD=mqttpassword #CHANGE
       - SCRAPE_INTERVAL=1800 #time in seconds between scrape
     depends_on:
       selenium:
@@ -100,7 +100,7 @@ networks: {}
 
 2. Start the container:
 
-```docker-compose up -d```
+```docker-compose up```
 
 The scraper will run automatically, scrape your USMS data every SCRAPE_INTERVAL seconds, and publish to MQTT if configured.
 
