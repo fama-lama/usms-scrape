@@ -62,7 +62,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 ```yaml
 services:
   usms-scrape:
-    image: famalama/usms-scrape:latest
+    image: famalama/usms-scrape:stable
     restart: unless-stopped
     container_name: usms-scrape
     environment:
