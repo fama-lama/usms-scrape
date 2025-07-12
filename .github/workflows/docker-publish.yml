@@ -1,16 +1,19 @@
-name: Build and Push Docker Image on Release
+name: Build and Push Docker Image
 
 on:
   push:
+    branches:
+      - main
+      - dev
     tags:
-      - 'v*'   # Only trigger on tags starting with "v"
+      - 'v*'
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Log in to Docker Hub
@@ -19,13 +22,23 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract tag name
-        id: get_tag
-        run: echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+      - name: Determine Docker tags
+        id: set_tags
+        run: |
+          TAGS=""
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            TAGS="famalama/usms-scrape:stable"
+          elif [[ "${GITHUB_REF}" == "refs/heads/dev" ]]; then
+            TAGS="famalama/usms-scrape:dev"
+          elif [[ "${GITHUB_REF}" =~ refs/tags/v.* ]]; then
+            VERSION_TAG=${GITHUB_REF##*/}
+            TAGS="famalama/usms-scrape:${VERSION_TAG} famalama/usms-scrape:stable"
+          fi
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          tags: famalama/usms-scrape:${{ env.TAG }}
+          tags: ${{ steps.set_tags.outputs.tags }}
