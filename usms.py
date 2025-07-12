@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -26,12 +26,18 @@ selenium_host = os.getenv("SELENIUM_HOST", "localhost")
 selenium_port = os.getenv("SELENIUM_PORT", "4444")
 
 mqtt_broker = os.getenv("MQTT_BROKER")
-mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+mqtt_port_str = os.getenv("MQTT_PORT")
 mqtt_username = os.getenv("MQTT_USERNAME")
 mqtt_password = os.getenv("MQTT_PASSWORD")
+
+try:
+    mqtt_port = int(mqtt_port_str) if mqtt_port_str and mqtt_port_str.isdigit() else 1883
+except ValueError:
+    mqtt_port = 1883
+
 scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "1800"))
 
-mqtt_enabled = all([mqtt_broker, mqtt_port, mqtt_username, mqtt_password]) and mqtt is not None
+mqtt_enabled = all([mqtt_broker, mqtt_username, mqtt_password]) and mqtt is not None
 
 # MQTT topics
 topic_unit = "home/usms/remaining_unit"
@@ -90,7 +96,7 @@ def scrape_data():
     remaining_unit = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
     remaining_balance = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
     meter_last_polled = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
-    last_run = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    last_run = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
     log.info(f"Unit: {remaining_unit}, Balance: {remaining_balance}, Last Polled: {meter_last_polled}, Time: {last_run}")
     return remaining_unit, remaining_balance, meter_last_polled, last_run
@@ -101,7 +107,7 @@ def publish_mqtt(unit, balance, polled, run_time):
         return
 
     try:
-        client = mqtt.Client()
+        client = mqtt.Client(client_id="", protocol=mqtt.MQTTv311)
         client.username_pw_set(mqtt_username, mqtt_password)
         client.connect(mqtt_broker, mqtt_port, 60)
 
