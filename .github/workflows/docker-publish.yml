@@ -3,7 +3,9 @@ name: Build and Push Docker Image
 on:
   push:
     branches:
-      - main   # or your default branch
+      - main
+    tags:
+      - 'v*'  # trigger on tags like v0.1.12
 
 jobs:
   build:
@@ -19,9 +21,17 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
+    - name: Extract tag name
+      id: get_tag
+      run: echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+
     - name: Build and push Docker image
       uses: docker/build-push-action@v4
       with:
         context: .
         push: true
-        tags: famalama/usms-scrape:latest
+        tags: |
+          famalama/usms-scrape:latest
+          famalama/usms-scrape:${{ env.TAG }}
+
+
