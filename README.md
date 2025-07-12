@@ -1,4 +1,6 @@
-# USMS Scraper BRUNEI
+
+## USMS Scraper BRUNEI 
+<img width="64" height="64" alt="usms" src="https://github.com/user-attachments/assets/e4e2fae5-b3ea-4b08-8b51-c8b1a5f4fdbf" /> 
 
 This project scrapes your USMS Smart Meter dashboard data using Selenium WebDriver and optionally publishes updates to an MQTT broker. It runs continuously at configurable intervals.
 
@@ -25,6 +27,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `selenium`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address                                                             | No       | N/A           |
+
 | `MQTT_PORT`      | MQTT broker port                                                                               | No       | N/A           |
 | `MQTT_USERNAME`  | Username for MQTT broker authentication                                                        | No       | N/A           |
 | `MQTT_PASSWORD`  | Password for MQTT broker authentication                                                        | No       | N/A           |
