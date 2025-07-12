@@ -1,65 +1,151 @@
 import os
 import time
-import json
 import logging
-from datetime import datetime
-import paho.mqtt.client as mqtt
+from datetime import datetime, timedelta, timezone
 from selenium import webdriver
-from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.remote.remote_connection import RemoteConnection
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import WebDriverException
+import socket
 
-# ENV
-USERNAME = os.getenv("USMS_USERNAME")
-PASSWORD = os.getenv("USMS_PASSWORD")
-SELENIUM_HOST = os.getenv("SELENIUM_HOST", "localhost")
-SELENIUM_PORT = os.getenv("SELENIUM_PORT", "4444")
-SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "600"))
+try:
+    import paho.mqtt.client as mqtt
+    from paho.mqtt.client import CallbackAPIVersion
+except ImportError:
+    mqtt = None  # Optional
 
-MQTT_HOST = os.getenv("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "usms/data")
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
-
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("usms")
 
-def get_data():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
+# Read config from environment variables
+usms_username = os.getenv("USMS_USERNAME")
+usms_password = os.getenv("USMS_PASSWORD")
+selenium_host = os.getenv("SELENIUM_HOST", "localhost")
+selenium_port = os.getenv("SELENIUM_PORT", "4444")
 
-    remote_url = f"http://{SELENIUM_HOST}:{SELENIUM_PORT}/wd/hub"
-    try:
-        driver = webdriver.Remote(command_executor=remote_url, options=options)
-        logging.info("Connected to Selenium")
-        driver.get("https://www.usms.com.my/")
-        # Stubbed logic
-        logging.info("Stub scrape successful.")
-        return {"timestamp": datetime.now().isoformat(), "value": "example"}
-    except Exception as e:
-        logging.error(f"Scraping error: {e}")
-        return None
-    finally:
+mqtt_broker = os.getenv("MQTT_BROKER")
+mqtt_port_str = os.getenv("MQTT_PORT")
+mqtt_username = os.getenv("MQTT_USERNAME")
+mqtt_password = os.getenv("MQTT_PASSWORD")
+
+try:
+    mqtt_port = int(mqtt_port_str) if mqtt_port_str and mqtt_port_str.isdigit() else 1883
+except ValueError:
+    mqtt_port = 1883
+
+scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "1800"))
+
+mqtt_enabled = all([mqtt_broker, mqtt_username, mqtt_password]) and mqtt is not None
+
+# MQTT topics
+topic_unit = "home/usms/remaining_unit"
+topic_balance = "home/usms/remaining_balance"
+topic_polled = "home/usms/meter_last_polled"
+topic_lastrun = "home/usms/last_run"
+
+# Configure Selenium options
+chrome_options = Options()
+chrome_options.add_argument("--headless=new")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+
+def create_driver():
+    for _ in range(5):
         try:
-            driver.quit()
-        except:
-            pass
+            return webdriver.Remote(
+                command_executor=f"http://{selenium_host}:{selenium_port}/wd/hub",
+                options=chrome_options
+            )
+        except WebDriverException as e:
+            log.warning(f"Selenium not ready yet: {e}")
+            time.sleep(3)
+    raise RuntimeError("Selenium host not reachable after retries.")
 
+driver = create_driver()
 
-# MQTT Callbacks
-def on_connect(client, userdata, flags, reason_code, properties=None):
-    if reason_code == 0:
-        logging.info("MQTT connected")
-    else:
-        logging.error(f"MQTT connect failed: {reason_code}")
+def is_logged_in():
+    driver.get("https://www.usms.com.bn/SmartMeter/Home")
+    try:
+        driver.find_element(By.XPATH, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div")
+        log.info("Already logged in.")
+        return True
+    except Exception:
+        log.info("Not logged in.")
+        return False
 
-def on_disconnect(client, userdata, reason_code, properties=None):
-    logging.warning(f"MQTT disconnected: {reason_code}")
+def login():
+    log.info("Logging in…")
+    driver.get("https://www.usms.com.bn/SmartMeter/ResLogin")
+    driver.find_element(By.ID, "ASPxRoundPanel1_txtUsername_I").send_keys(usms_username)
+    driver.find_element(By.ID, "ASPxRoundPanel1_txtPassword_I").send_keys(usms_password)
+    driver.find_element(By.ID, "ASPxRoundPanel1_btnLogin").click()
+    time.sleep(3)
 
-def on_publish(client, userdata, mid):
-    logging.info(f"Published payload id={mid}")
+def safe_get_text(xpath):
+    try:
+        return driver.find_element(By.XPATH, xpath).text
+    except Exception as e:
+        log.warning(f"Failed to find element {xpath}: {e}")
+        return "N/A"
 
-# Setup MQTT client
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERS
+def scrape_data():
+    log.info("Scraping dashboard…")
+    driver.get("https://www.usms.com.bn/SmartMeter/Home")
+    remaining_unit = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
+    remaining_balance = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
+    meter_last_polled = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
+    last_run = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+    log.info(f"Unit: {remaining_unit}, Balance: {remaining_balance}, Last Polled: {meter_last_polled}, Time: {last_run}")
+    return remaining_unit, remaining_balance, meter_last_polled, last_run
+
+def publish_mqtt(unit, balance, polled, run_time):
+    if not mqtt_enabled:
+        log.info("MQTT not configured, skipping publish.")
+        return
+
+    try:
+        client = mqtt.Client(
+            client_id=f"usms-{socket.gethostname()}",
+            protocol=mqtt.MQTTv5,
+            callback_api_version=CallbackAPIVersion.V5
+        )
+        client.username_pw_set(mqtt_username, mqtt_password)
+        client.connect_async(mqtt_broker, mqtt_port)
+        client.loop_start()
+
+        client.publish(topic_unit, unit, retain=True)
+        client.publish(topic_balance, balance, retain=True)
+        client.publish(topic_polled, polled, retain=True)
+        client.publish(topic_lastrun, run_time, retain=True)
+
+        log.info("Published to MQTT.")
+        time.sleep(1)  # ensure publishes flush before disconnect
+        client.loop_stop()
+        client.disconnect()
+    except Exception as e:
+        log.error(f"MQTT error: {e}")
+
+def print_summary(unit, balance, polled, run_time):
+    print("\n=== USMS Data Summary ===")
+    print(f"Remaining Unit    : {unit}")
+    print(f"Remaining Balance : {balance}")
+    print(f"Meter Last Polled : {polled}")
+    print(f"Last Run Time     : {run_time}")
+    print("========================\n")
+
+try:
+    while True:
+        try:
+            if not is_logged_in():
+                login()
+            unit, balance, polled, run_time = scrape_data()
+            publish_mqtt(unit, balance, polled, run_time)
+            print_summary(unit, balance, polled, run_time)
+        except Exception as e:
+            log.error(f"Error during cycle: {e}")
+        log.info(f"Sleeping {scrape_interval}s…")
+        time.sleep(scrape_interval)
+finally:
+    driver.quit()
