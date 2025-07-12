@@ -22,8 +22,8 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
 | `USMS_USERNAME`  | Your USMS Smart Meter account username                                                         | Yes      | N/A           |
 | `USMS_PASSWORD`  | Your USMS Smart Meter account password                                                         | Yes      | N/A           |
-| `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | No       | `selenium`   |
-| `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | No       | `4444`        |
+| `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `selenium`   |
+| `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address                                                             | No       | N/A           |
 | `MQTT_PORT`      | MQTT broker port                                                                               | No       | N/A           |
 | `MQTT_USERNAME`  | Username for MQTT broker authentication                                                        | No       | N/A           |
