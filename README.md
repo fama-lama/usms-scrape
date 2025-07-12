@@ -20,7 +20,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 
 | Variable         | Description                                                                                     | Required | Default       |
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
-| `USMS_USERNAME`  | Your USMS Smart Meter account username                                                         | Yes      | N/A           |
+| `USMS_USERNAME`  | Your USMS Smart Meter account username (Brunei IC number)                                       | Yes      | N/A           |
 | `USMS_PASSWORD`  | Your USMS Smart Meter account password                                                         | Yes      | N/A           |
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `selenium`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
@@ -59,14 +59,14 @@ services:
     restart: unless-stopped
     container_name: usms-scrape
     environment:
-      - USMS_USERNAME=01234567 #USMS account IC number 
-      - USMS_PASSWORD=PASSWORD123! #USMS password
+      - USMS_USERNAME=01234567 #CHANGE 
+      - USMS_PASSWORD=PASSWORD123! #CHANGE
       - SELENIUM_HOST=selenium 
       - SELENIUM_PORT=4444 
-      - MQTT_BROKER= #IP address of MQTT broker
-      - MQTT_PORT= #Port of MQTT broker
-      - MQTT_USERNAME= #MQTT username
-      - MQTT_PASSWORD= #MQTT password
+      - MQTT_BROKER= #CHANGE
+      - MQTT_PORT= #CHANGE
+      - MQTT_USERNAME= #CHANGE
+      - MQTT_PASSWORD= #CHANGE
       - SCRAPE_INTERVAL=1800 #time in seconds between scrape
     depends_on:
       selenium:
