@@ -28,7 +28,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 | `MQTT_PORT`      | MQTT broker port                                                                               | No       | N/A           |
 | `MQTT_USERNAME`  | Username for MQTT broker authentication                                                        | No       | N/A           |
 | `MQTT_PASSWORD`  | Password for MQTT broker authentication                                                        | No       | N/A           |
-| `SCRAPE_INTERVAL`| Time interval between scraping runs in seconds (integer)                                      | No       | `1800` (30 min)|
+| `SCRAPE_INTERVAL`| Time interval between scraping runs in seconds (integer)                                      | Yes       | `1800` (30 min)|
 
 ---
 
@@ -45,8 +45,12 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 
 ### Prerequisites
 
-- Selenium WebDriver running and accessible (e.g., Selenium Grid or standalone ChromeDriver)  
-- (Optional) MQTT broker accessible for publishing updates  
+- USMS account registered to smart meter
+- Docker Compose
+
+  
+- (Optional) MQTT broker accessible for publishing updates
+  (note: without MQTT broker, information is printed into log only.)
 
 ### Running with Docker Compose
 
