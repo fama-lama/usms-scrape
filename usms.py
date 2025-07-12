@@ -107,7 +107,7 @@ def publish_mqtt(unit, balance, polled, run_time):
         return
 
     try:
-        client = mqtt.Client(client_id="", protocol=mqtt.MQTTv311)
+        client = mqtt.Client(client_id="", protocol=mqtt.MQTTv311, callback_api_version=5)
         client.username_pw_set(mqtt_username, mqtt_password)
         client.connect(mqtt_broker, mqtt_port, 60)
 
