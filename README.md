@@ -55,17 +55,39 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 ```yaml
 services:
   usms-scrape:
-    image: famalama/usms-scrape:0.1
+    image: famalama/usms-scrape:latest
+    restart: unless-stopped
+    container_name: usms-scrape
     environment:
-      USMS_USERNAME: yourusername
-      USMS_PASSWORD: yourpassword
-      SELENIUM_HOST: selenium
-      SELENIUM_PORT: 4444
-      MQTT_BROKER: mqtt_broker_ip
-      MQTT_PORT: 1883
-      MQTT_USERNAME: mqtt_user
-      MQTT_PASSWORD: mqtt_password
-      SCRAPE_INTERVAL: 1800
+      - USMS_USERNAME=01234567 #USMS account IC number 
+      - USMS_PASSWORD=PASSWORD #USMS password
+      - SELENIUM_HOST=selenium 
+      - SELENIUM_PORT=4444 
+      - MQTT_BROKER= #IP address of MQTT broker
+      - MQTT_PORT= #Port of MQTT broker
+      - MQTT_USERNAME= #MQTT username
+      - MQTT_PASSWORD= #MQTT password
+      - SCRAPE_INTERVAL=1800 #time in seconds between scrape
+    depends_on:
+      selenium:
+        condition: service_healthy
+  selenium:
+    image: selenium/standalone-chrome:latest
+    container_name: selenium
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:4444/wd/hub/status
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+    ports:
+      - 4444:4444
+networks: {}
+
 ```
 
 
@@ -80,8 +102,6 @@ The scraper will run automatically, scrape your USMS data every SCRAPE_INTERVAL 
 The main scraper script is usms.py.
 
 Uses Selenium for browser automation and scraping. 
-
-Requires Python dependencies listed in requirements.txt (including selenium and optionally paho-mqtt). 
 
 Environment variables control behavior and credentials.
 
