@@ -6,16 +6,17 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import WebDriverException
-import socket
 
 try:
     import paho.mqtt.client as mqtt
-    from paho.mqtt.client import CallbackAPIVersion
 except ImportError:
     mqtt = None  # Optional
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("usms")
 
 # Read config from environment variables
@@ -46,7 +47,7 @@ topic_lastrun = "home/usms/last_run"
 
 # Configure Selenium options
 chrome_options = Options()
-chrome_options.add_argument("--headless=new")
+chrome_options.add_argument("--headless")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
 
@@ -106,23 +107,16 @@ def publish_mqtt(unit, balance, polled, run_time):
         return
 
     try:
-        client = mqtt.Client(
-            client_id=f"usms-{socket.gethostname()}",
-            protocol=mqtt.MQTTv5,
-            callback_api_version=CallbackAPIVersion.V5
-        )
+        client = mqtt.Client(client_id="", protocol=mqtt.MQTTv5)
         client.username_pw_set(mqtt_username, mqtt_password)
-        client.connect_async(mqtt_broker, mqtt_port)
-        client.loop_start()
+        client.connect(mqtt_broker, mqtt_port, 60)
 
-        client.publish(topic_unit, unit, retain=True)
-        client.publish(topic_balance, balance, retain=True)
-        client.publish(topic_polled, polled, retain=True)
-        client.publish(topic_lastrun, run_time, retain=True)
+        client.publish(topic_unit, unit)
+        client.publish(topic_balance, balance)
+        client.publish(topic_polled, polled)
+        client.publish(topic_lastrun, run_time)
 
         log.info("Published to MQTT.")
-        time.sleep(1)  # ensure publishes flush before disconnect
-        client.loop_stop()
         client.disconnect()
     except Exception as e:
         log.error(f"MQTT error: {e}")
