@@ -60,7 +60,7 @@ services:
     container_name: usms-scrape
     environment:
       - USMS_USERNAME=01234567 #USMS account IC number 
-      - USMS_PASSWORD=PASSWORD #USMS password
+      - USMS_PASSWORD=PASSWORD123! #USMS password
       - SELENIUM_HOST=selenium 
       - SELENIUM_PORT=4444 
       - MQTT_BROKER= #IP address of MQTT broker
