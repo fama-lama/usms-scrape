@@ -110,18 +110,22 @@ def main():
 
     while True:
         try:
+            # Check for dead session
+            if not driver.session_id:
+                raise Exception("Driver session missing, recreating")
+
             unit, balance, last_polled = scrape(driver)
             log.info(f"Unit: {unit}, Balance: {balance}, Last Polled: {last_polled}")
             if client:
                 mqtt_publish(client, unit, balance, last_polled)
         except Exception as e:
             # Handle Selenium session expiry by recreating the driver
-            if "NoSuchSessionException" in str(e) or "Unable to find session" in str(e):
+            if "NoSuchSessionException" in str(e) or "Unable to find session" in str(e) or "session missing" in str(e):
                 log.warning("Selenium session expired. Recreating driver...")
                 try:
                     driver.quit()
                 except Exception:
-                    pass  # Ignore errors quitting old driver
+                    pass
                 driver = create_driver()
             else:
                 log.error(f"Error during scraping: {e}")
