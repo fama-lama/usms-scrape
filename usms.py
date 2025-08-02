@@ -127,20 +127,18 @@ def print_summary(unit, balance, polled, run_time):
     print(f"Last Run Time     : {run_time}")
     print("========================\n")
 
-# === ✅ CHANGED MAIN LOOP ===
-try:
-    while True:
-        driver = create_driver()
-        try:
-            if not is_logged_in(driver):
-                login(driver)
-            unit, balance, polled, run_time = scrape_data(driver)
-            publish_mqtt(unit, balance, polled, run_time)
-            print_summary(unit, balance, polled, run_time)
-        except Exception as e:
-            log.error(f"Error during cycle: {e}")
-        finally:
-            driver.quit()
+while True:
+    driver = create_driver()
+    try:
+        if not is_logged_in(driver):
+            login(driver)
+        unit, balance, polled, run_time = scrape_data(driver)
+        publish_mqtt(unit, balance, polled, run_time)
+        print_summary(unit, balance, polled, run_time)
+    except Exception as e:
+        log.error(f"Error during cycle: {e}")
+    finally:
+        driver.quit()
 
-        log.info(f"Sleeping {scrape_interval}s…")
-        time.sleep(scrape_interval)
+    log.info(f"Sleeping {scrape_interval}s…")
+    time.sleep(scrape_interval)
