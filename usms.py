@@ -63,9 +63,7 @@ def create_driver():
             time.sleep(3)
     raise RuntimeError("Selenium host not reachable after retries.")
 
-driver = create_driver()
-
-def is_logged_in():
+def is_logged_in(driver):
     driver.get("https://www.usms.com.bn/SmartMeter/Home")
     try:
         driver.find_element(By.XPATH, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div")
@@ -75,7 +73,7 @@ def is_logged_in():
         log.info("Not logged in.")
         return False
 
-def login():
+def login(driver):
     log.info("Logging in…")
     driver.get("https://www.usms.com.bn/SmartMeter/ResLogin")
     driver.find_element(By.ID, "ASPxRoundPanel1_txtUsername_I").send_keys(usms_username)
@@ -83,19 +81,19 @@ def login():
     driver.find_element(By.ID, "ASPxRoundPanel1_btnLogin").click()
     time.sleep(3)
 
-def safe_get_text(xpath):
+def safe_get_text(driver, xpath):
     try:
         return driver.find_element(By.XPATH, xpath).text
     except Exception as e:
         log.warning(f"Failed to find element {xpath}: {e}")
         return "N/A"
 
-def scrape_data():
+def scrape_data(driver):
     log.info("Scraping dashboard…")
     driver.get("https://www.usms.com.bn/SmartMeter/Home")
-    remaining_unit = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
-    remaining_balance = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
-    meter_last_polled = safe_get_text("/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
+    remaining_unit = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
+    remaining_balance = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
+    meter_last_polled = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
     last_run = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
     log.info(f"Unit: {remaining_unit}, Balance: {remaining_balance}, Last Polled: {meter_last_polled}, Time: {last_run}")
@@ -129,17 +127,20 @@ def print_summary(unit, balance, polled, run_time):
     print(f"Last Run Time     : {run_time}")
     print("========================\n")
 
+# === ✅ CHANGED MAIN LOOP ===
 try:
     while True:
+        driver = create_driver()
         try:
-            if not is_logged_in():
-                login()
-            unit, balance, polled, run_time = scrape_data()
+            if not is_logged_in(driver):
+                login(driver)
+            unit, balance, polled, run_time = scrape_data(driver)
             publish_mqtt(unit, balance, polled, run_time)
             print_summary(unit, balance, polled, run_time)
         except Exception as e:
             log.error(f"Error during cycle: {e}")
+        finally:
+            driver.quit()
+
         log.info(f"Sleeping {scrape_interval}s…")
         time.sleep(scrape_interval)
-finally:
-    driver.quit()
