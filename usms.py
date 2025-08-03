@@ -36,6 +36,7 @@ except ValueError:
     mqtt_port = 1883
 
 scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "1800"))
+
 mqtt_enabled = all([mqtt_broker, mqtt_username, mqtt_password]) and mqtt is not None
 
 # MQTT topics
@@ -82,7 +83,7 @@ def login(driver):
 
 def safe_get_text(driver, xpath):
     try:
-        return driver.find_element(By.XPATH, xpath).text
+        return driver.find_element(By.XPATH, xpath).text.strip()
     except Exception as e:
         log.warning(f"Failed to find element {xpath}: {e}")
         return "N/A"
@@ -90,29 +91,25 @@ def safe_get_text(driver, xpath):
 def scrape_data(driver):
     log.info("Scraping dashboard…")
     driver.get("https://www.usms.com.bn/SmartMeter/Home")
-    remaining_unit = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
-    remaining_balance = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
-    meter_last_polled = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
-    last_run = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-
-    log.info(f"Unit: {remaining_unit}, Balance: {remaining_balance}, Last Polled: {meter_last_polled}, Time: {last_run}")
-    return remaining_unit, remaining_balance, meter_last_polled, last_run
+    unit = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[9]/td/table/tbody/tr/td[2]")
+    balance = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[10]/td/table/tbody/tr/td[2]")
+    polled = safe_get_text(driver, "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]")
+    run_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    log.info(f"Unit: {unit}, Balance: {balance}, Last Polled: {polled}, Time: {run_time}")
+    return unit, balance, polled, run_time
 
 def publish_mqtt(unit, balance, polled, run_time):
     if not mqtt_enabled:
         log.info("MQTT not configured, skipping publish.")
         return
-
     try:
         client = mqtt.Client(client_id="", protocol=mqtt.MQTTv5)
         client.username_pw_set(mqtt_username, mqtt_password)
         client.connect(mqtt_broker, mqtt_port, 60)
-
         client.publish(topic_unit, unit)
         client.publish(topic_balance, balance)
         client.publish(topic_polled, polled)
         client.publish(topic_lastrun, run_time)
-
         log.info("Published to MQTT.")
         client.disconnect()
     except Exception as e:
@@ -126,7 +123,9 @@ def print_summary(unit, balance, polled, run_time):
     print(f"Last Run Time     : {run_time}")
     print("========================\n")
 
+# === MAIN LOOP ===
 while True:
+    driver = None
     try:
         driver = create_driver()
         if not is_logged_in(driver):
@@ -135,11 +134,12 @@ while True:
         publish_mqtt(unit, balance, polled, run_time)
         print_summary(unit, balance, polled, run_time)
     except Exception as e:
-        log.error(f"Error during cycle: {e}")
+        log.error(f"Error during scrape cycle: {e}")
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
     log.info(f"Sleeping {scrape_interval}s…")
     time.sleep(scrape_interval)
