@@ -15,6 +15,11 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - Scrapes remaining units, balance, and meter last polled time  
 - Optionally publishes data to MQTT topics  
 - Runs continuously with configurable scrape interval  
+- **Robust login**: Uses `WebDriverWait` instead of blind `time.sleep()` — waits for the dashboard to actually load
+- **Smart failure handling**: Skips MQTT publish on all-`N/A` results — preserves last good sensor data in Home Assistant
+- **Auto-heal**: After 3 consecutive scrape failures, the container exits so Docker's `restart: unless-stopped` recycles it cleanly
+- **Debug friendly**: Logs page title, URL, and body text on scrape failure so you can see exactly what the USMS site returned
+- **Fresh session per cycle**: Creates clean Chrome options and cleans up WebDriver connections every cycle to prevent long-running connection leaks
 
 ---
 
