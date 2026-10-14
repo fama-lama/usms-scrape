@@ -27,7 +27,10 @@ jobs:
 
       - name: Determine Docker tags
         id: set_tags
+        shell: bash
         run: |
+          # build-push-action expects NEWLINE-delimited tags. A space-joined pair is parsed
+          # as one invalid reference, which is why every tag build failed before this.
           TAGS=""
           if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
             TAGS="famalama/usms-scrape:stable"
@@ -35,9 +38,13 @@ jobs:
             TAGS="famalama/usms-scrape:dev"
           elif [[ "${GITHUB_REF}" =~ refs/tags/v.* ]]; then
             VERSION_TAG=${GITHUB_REF##*/}
-            TAGS="famalama/usms-scrape:${VERSION_TAG} famalama/usms-scrape:stable"
+            TAGS="famalama/usms-scrape:${VERSION_TAG}"$'\n'"famalama/usms-scrape:stable"
           fi
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          {
+            echo "tags<<__TAGS__"
+            echo "${TAGS}"
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
