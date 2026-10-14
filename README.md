@@ -16,6 +16,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - Optionally publishes data to MQTT topics  
 - Runs continuously with configurable scrape interval  
 - **Robust login**: Uses `WebDriverWait` instead of blind `time.sleep()` — waits for the dashboard to actually load
+- **Captcha login**: The site's second login stage asks for a captcha. It is read locally by `ddddocr` and only submitted when 4 of 5 OCR passes agree; a disagreement just re-rolls a fresh code, which costs nothing
 - **Smart failure handling**: Skips MQTT publish on all-`N/A` results — preserves last good sensor data in Home Assistant
 - **Auto-heal**: After 3 consecutive scrape failures, the container exits so Docker's `restart: unless-stopped` recycles it cleanly
 - **Debug friendly**: Logs page title, URL, and body text on scrape failure so you can see exactly what the USMS site returned
@@ -145,6 +146,8 @@ The main scraper script is usms.py.
 Uses Selenium for browser automation and scraping. 
 
 Environment variables control behavior and credentials.
+
+Login is two stages: `ResLogin` takes the IC and password, then hands over to `ResLogin?sc=…`, which asks for both again plus a captcha. The code is read by `ddddocr` (CPU-only ONNX model — no GPU, no network call and no human input), and the captcha image is read out of Chrome's own cache because its URL is single-use.
 
 ## License
 
