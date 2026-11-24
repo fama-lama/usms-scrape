@@ -141,15 +141,26 @@ def _harden_onnxruntime():
         return options
 
     def hardened_session(*args, **kwargs):
+        untouched_args, untouched_kwargs = args, dict(kwargs)
         options = kwargs.get("sess_options")
-        if options is None and len(args) > 1 and isinstance(args[1], ort.SessionOptions):
+        positional = len(args) > 1
+        if options is None and positional and isinstance(args[1], ort.SessionOptions):
             options = args[1]
+        # Only add or mutate options when that slot is free or already options-shaped.
+        # An argument we do not recognise is passed straight through untouched.
+        if options is None and positional and args[1] is not None:
+            return original_session(*args, **kwargs)
         options = _apply(options if options is not None else ort.SessionOptions())
-        if len(args) > 1:
+        if positional:
             args = (args[0], options) + args[2:]   # replace the positional slot
         else:
             kwargs["sess_options"] = options
-        return original_session(*args, **kwargs)
+        try:
+            return original_session(*args, **kwargs)
+        except TypeError:
+            # A future ONNX Runtime that rejects the options we inject must never
+            # cost us captcha solving: retry the caller's exact call instead.
+            return original_session(*untouched_args, **untouched_kwargs)
 
     ort.InferenceSession = hardened_session  # type: ignore[assignment]
     setattr(ort, "_usms_affinity_hardened", True)
