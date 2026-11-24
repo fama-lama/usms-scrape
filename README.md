@@ -69,9 +69,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 ```yaml
 services:
   usms-scrape:
-    # Always use a published tag: :stable (current release) or a v* version tag.
-    # The :latest tag is not kept up to date, so pin :stable instead.
-    image: famalama/usms-scrape:stable
+    image: famalama/usms-scrape:latest
     restart: unless-stopped          # survive a host reboot and the built-in auto-heal exit
     container_name: usms-scrape
     environment:

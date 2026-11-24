@@ -33,12 +33,14 @@ jobs:
           # as one invalid reference, which is why every tag build failed before this.
           TAGS=""
           if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            TAGS="famalama/usms-scrape:stable"
+            # main publishes the current release under both tags, so :latest and
+            # :stable always point at the same image.
+            TAGS="famalama/usms-scrape:stable"$'\n'"famalama/usms-scrape:latest"
           elif [[ "${GITHUB_REF}" == "refs/heads/dev" ]]; then
             TAGS="famalama/usms-scrape:dev"
           elif [[ "${GITHUB_REF}" =~ refs/tags/v.* ]]; then
             VERSION_TAG=${GITHUB_REF##*/}
-            TAGS="famalama/usms-scrape:${VERSION_TAG}"$'\n'"famalama/usms-scrape:stable"
+            TAGS="famalama/usms-scrape:${VERSION_TAG}"$'\n'"famalama/usms-scrape:stable"$'\n'"famalama/usms-scrape:latest"
           fi
           {
             echo "tags<<__TAGS__"
