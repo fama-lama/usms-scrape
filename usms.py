@@ -328,8 +328,12 @@ def _engines():
     return _captcha_engines
 
 
-def _read_captcha_variants(png_bytes):
-    """Five independent readings of the same captcha image."""
+def _read_captcha_variants(png_bytes, cycle_id="none"):
+    """Five independent readings of the same captcha image.
+
+    Every variant logs its answer and its inference time at DEBUG, so a slow host
+    or a model that is starting to disagree is visible without guessing.
+    """
     eng_old, eng_beta = _engines()
     im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     canvas = Image.new("RGBA", im.size, (255, 255, 255, 255))  # flatten transparency to white
@@ -342,13 +346,22 @@ def _read_captcha_variants(png_bytes):
     binarised = upscaled.convert("L").point(lambda p: 0 if p < 180 else 255).convert("RGB")
     buf = io.BytesIO(); binarised.save(buf, format="PNG"); x2bin = buf.getvalue()
 
-    return {
-        "raw": eng_old.classification(raw).strip().lower(),
-        "x2": eng_old.classification(x2).strip().lower(),
-        "x2bin": eng_old.classification(x2bin).strip().lower(),
-        "beta_raw": eng_beta.classification(raw).strip().lower(),
-        "beta_x2bin": eng_beta.classification(x2bin).strip().lower(),
-    }
+    log.debug("cycle=%s captcha image %dx%d, %d bytes from the fetch",
+              cycle_id, rgb.width, rgb.height, len(png_bytes))
+
+    readings = {}
+    for variant, engine, payload in (
+        ("raw", eng_old, raw),
+        ("x2", eng_old, x2),
+        ("x2bin", eng_old, x2bin),
+        ("beta_raw", eng_beta, raw),
+        ("beta_x2bin", eng_beta, x2bin),
+    ):
+        started = time.monotonic()
+        readings[variant] = engine.classification(payload).strip().lower()
+        log.debug("cycle=%s captcha %s -> %r in %.1fms",
+                  cycle_id, variant, readings[variant], (time.monotonic() - started) * 1000)
+    return readings
 
 
 def _valid_code(code):
@@ -449,33 +462,47 @@ def _refresh_captcha(driver, previous_src):
     return False
 
 
-def solve_captcha(driver):
+def solve_captcha(driver, cycle_id="none"):
     """Read the stage-2 captcha, re-rolling until the OCR models agree."""
     for attempt in range(1, CAPTCHA_MAX_ROLLS + 1):
         _cycle_state["captcha_rolls"] = attempt
         src_before = _captcha_src(driver)
+        log.debug("cycle=%s captcha roll %d/%d: image src=%s",
+                  cycle_id, attempt, CAPTCHA_MAX_ROLLS, src_before)
         png = _captcha_png(driver, attempt)
         if png:
             try:
-                readings = _read_captcha_variants(png)
+                readings = _read_captcha_variants(png, cycle_id)
             except Exception as e:
-                log.warning("Captcha attempt %d: OCR failed: %s: %s",
-                            attempt, type(e).__name__, e)
+                log.warning("cycle=%s captcha attempt %d: OCR failed: %s: %s",
+                            cycle_id, attempt, type(e).__name__, e)
                 readings = {}
             if readings:
                 code, votes = Counter(readings.values()).most_common(1)[0]
-                log.info("Captcha attempt %d/%d: %r (%d/5 models agree) %s",
-                         attempt, CAPTCHA_MAX_ROLLS, code, votes, json.dumps(readings))
+                log.info("cycle=%s captcha attempt %d/%d: %r (%d/5 models agree) %s",
+                         cycle_id, attempt, CAPTCHA_MAX_ROLLS, code, votes, json.dumps(readings))
                 if _valid_code(code) and votes >= CAPTCHA_MIN_VOTES:
+                    log.debug("cycle=%s captcha accepted on roll %d: %r (%d votes, %d chars)",
+                              cycle_id, attempt, code, votes, len(code))
                     return code
+                reasons = []
+                if not _valid_code(code):
+                    reasons.append(f"shape: {len(code)} chars, expected {CAPTCHA_CODE_LENGTH}")
+                if votes < CAPTCHA_MIN_VOTES:
+                    reasons.append(f"agreement {votes} < {CAPTCHA_MIN_VOTES}")
+                log.debug("cycle=%s captcha roll %d rejected (%s) — re-rolling",
+                          cycle_id, attempt, "; ".join(reasons))
 
         # Disagreement or unreadable: ask for a new challenge instead of guessing.
         if attempt == CAPTCHA_MAX_ROLLS:
             break
         if not _refresh_captcha(driver, src_before):
+            log.warning("cycle=%s captcha re-roll unavailable after attempt %d — stopping early.",
+                        cycle_id, attempt)
             break
 
-    log.warning("Gave up reading the captcha after %d attempts.", _cycle_state["captcha_rolls"])
+    log.warning("cycle=%s gave up reading the captcha after %d attempts.",
+                cycle_id, _cycle_state["captcha_rolls"])
     return None
 
 
@@ -510,6 +537,9 @@ def create_driver():
             driver.set_script_timeout(30)               # needed by the captcha cache read
             driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
             log.info("WebDriver session ready (attempt %d/%d)", attempt, SELENIUM_ATTEMPTS)
+            log.debug("WebDriver session %s: page-load timeout %ss, script timeout 30s, "
+                      "headless, session id %s", attempt, PAGE_LOAD_TIMEOUT,
+                      getattr(driver, "session_id", "?"))
             return driver
         except Exception as e:
             last_exc = e
@@ -524,13 +554,21 @@ def create_driver():
 
 def _navigate(driver, url, what, cycle_id="none"):
     """driver.get() with the page-load timeout turned into a log line, not a hang."""
+    started = time.monotonic()
     try:
         driver.get(url)
-        return True
     except TimeoutException:
         log.warning("cycle=%s %s did not finish loading within %ss — using whatever "
-                    "rendered.", cycle_id, what, PAGE_LOAD_TIMEOUT)
+                    "rendered (%.1fs).", cycle_id, what, PAGE_LOAD_TIMEOUT,
+                    time.monotonic() - started)
         return False
+    try:
+        log.debug("cycle=%s %s loaded in %.1fs: title=%r url=%s",
+                  cycle_id, what, time.monotonic() - started, driver.title, driver.current_url)
+    except Exception:
+        log.debug("cycle=%s %s loaded in %.1fs",
+                  cycle_id, what, time.monotonic() - started)
+    return True
 
 
 _DIGITS = re.compile(r"\d")
@@ -631,7 +669,10 @@ def login(driver, cycle_id="none"):
 
     _type(driver, "#ASPxRoundPanel1_txtUsername_I", usms_username)
     _type(driver, "#ASPxRoundPanel1_txtPassword_I", usms_password)
+    log.debug("cycle=%s stage-1 credentials filled (%d-char username, %d-char password)",
+              cycle_id, len(usms_username or ""), len(usms_password or ""))
     _click(driver, "#ASPxRoundPanel1_btnLogin")
+    log.debug("cycle=%s stage-1 submitted, waiting for the redirect", cycle_id)
 
     # Either the captcha stage shows up (normal) or we went straight in.
     try:
@@ -650,7 +691,7 @@ def login(driver, cycle_id="none"):
 
     log.info("cycle=%s stage 1 accepted; solving the stage-2 captcha on %s",
              cycle_id, driver.current_url)
-    code = solve_captcha(driver)
+    code = solve_captcha(driver, cycle_id)
     if not code:
         log_page_source(driver, "Captcha unreadable", cycle_id)
         return False
@@ -688,18 +729,24 @@ def login(driver, cycle_id="none"):
 # Scraping
 # ---------------------------------------------------------------------------
 
-def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT):
+def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT, cycle_id="none", field="cell"):
     """Text of one element, or None.
 
     Waits for NON-EMPTY text, not merely for the element to exist: a present but
     empty cell used to return '' which every N/A guard then let through.
     """
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     last_error = None
+    reads = 0
     while True:
+        reads += 1
         try:
             text = (driver.find_element(By.XPATH, xpath).text or "").strip()
             if text:
+                log.debug("cycle=%s %s read %r after %.0fms (%d read%s)",
+                          cycle_id, field, text, (time.monotonic() - started) * 1000,
+                          reads, "" if reads == 1 else "s")
                 return text
         except Exception as e:
             last_error = e
@@ -708,9 +755,12 @@ def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT):
         time.sleep(0.5)
 
     if last_error is not None:
-        log.warning("No text in %s within %ss (last error: %s)", xpath, timeout, last_error)
+        log.warning("cycle=%s %s: no text within %ss (%d reads, last error: %s: %s)",
+                    cycle_id, field, timeout, reads,
+                    type(last_error).__name__, last_error)
     else:
-        log.warning("Element %s stayed empty for %ss", xpath, timeout)
+        log.warning("cycle=%s %s: element stayed empty for %ss (%d reads)",
+                    cycle_id, field, timeout, reads)
     return None
 
 
@@ -725,24 +775,31 @@ _FIELD_SHAPES = {
 }
 
 
-def validate_value(field, value):
+def validate_value(field, value, cycle_id="none"):
     """value when it matches the field's shape, otherwise None (treated as N/A)."""
     if value is None:
         return None
+    value = value.strip()          # a stray space must not fail the shape check
     pattern, hint = _FIELD_SHAPES[field]
     if pattern.match(value):
+        log.debug("cycle=%s %s=%r passed the %s shape check", cycle_id, field, value, field)
         return value
-    log.warning("%s = %r does not look like %s — treating this field as unavailable.",
-                field, value, hint)
+    log.warning("cycle=%s %s = %r does not look like %s — treating this field as unavailable.",
+                cycle_id, field, value, hint)
     return None
 
 
-def _read_dashboard(driver, timeout=ELEMENT_TIMEOUT):
-    return {
-        "unit": validate_value("unit", safe_get_text(driver, XPATH_UNIT, timeout)),
-        "balance": validate_value("balance", safe_get_text(driver, XPATH_BALANCE, timeout)),
-        "polled": validate_value("polled", safe_get_text(driver, XPATH_POLLED, timeout)),
-    }
+def _read_dashboard(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
+    started = time.monotonic()
+    values = {}
+    for field, xpath in (("unit", XPATH_UNIT), ("balance", XPATH_BALANCE),
+                         ("polled", XPATH_POLLED)):
+        values[field] = validate_value(
+            field, safe_get_text(driver, xpath, timeout, cycle_id, field), cycle_id)
+    log.debug("cycle=%s dashboard read in %.1fs: %s",
+              cycle_id, time.monotonic() - started,
+              {k: v for k, v in values.items()})
+    return values
 
 
 def scrape_data(driver, cycle_id="none"):
@@ -750,7 +807,7 @@ def scrape_data(driver, cycle_id="none"):
     log.info("cycle=%s scraping dashboard…", cycle_id)
     _navigate(driver, DASHBOARD_URL, "dashboard", cycle_id)
 
-    values = _read_dashboard(driver)
+    values = _read_dashboard(driver, cycle_id=cycle_id)
     missing = [name for name, value in values.items() if value is None]
 
     if missing:
@@ -759,7 +816,8 @@ def scrape_data(driver, cycle_id="none"):
                  cycle_id, ", ".join(missing))
         time.sleep(SCRAPE_RETRY_SLEEP)
         _navigate(driver, DASHBOARD_URL, "dashboard (retry)", cycle_id)
-        for name, value in _read_dashboard(driver, timeout=ELEMENT_TIMEOUT + 5).items():
+        for name, value in _read_dashboard(
+                driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id).items():
             if values[name] is None and value is not None:
                 values[name] = value
                 log.info("cycle=%s %s recovered on the retry: %r", cycle_id, name, value)
@@ -791,19 +849,21 @@ def result_status(unit, balance, polled):
 
 def _publish_topic(client, topic, value, cycle_id):
     """Publish one retained QoS-1 value and report whether the broker took it."""
+    started = time.monotonic()
     try:
         info = client.publish(topic, value, qos=1, retain=True)
         info.wait_for_publish(timeout=5)
     except Exception as e:
-        log.warning("cycle=%s mqtt %s NOT published: %s: %s",
-                    cycle_id, topic, type(e).__name__, e)
+        log.warning("cycle=%s mqtt %s NOT published after %.1fs: %s: %s",
+                    cycle_id, topic, time.monotonic() - started, type(e).__name__, e)
         return False
 
     rc = getattr(info, "rc", None)
     is_published = getattr(info, "is_published", None)
     confirmed = is_published() if callable(is_published) else True
     if rc == mqtt.MQTT_ERR_SUCCESS and confirmed:
-        log.info("cycle=%s mqtt %s = %r (qos=1 retain)", cycle_id, topic, value)
+        log.info("cycle=%s mqtt %s = %r (qos=1 retain, acked in %.0fms)",
+                 cycle_id, topic, value, (time.monotonic() - started) * 1000)
         return True
 
     log.warning("cycle=%s mqtt %s NOT published (rc=%s published=%s)",
@@ -845,6 +905,8 @@ def publish_mqtt(unit, balance, polled, run_time, cycle_id="none"):
             log.error("cycle=%s mqtt connect to %s:%s returned rc=%s",
                       cycle_id, mqtt_broker, mqtt_port, rc)
             return False
+        log.debug("cycle=%s mqtt connected to %s:%s (rc=%s, will=%r)",
+                  cycle_id, mqtt_broker, mqtt_port, rc, "offline")
 
         client.loop_start()
         published["unit"] = _publish_topic(client, topic_unit, unit, cycle_id) if unit else False
@@ -910,6 +972,9 @@ def run_cycle(cycle_id="none"):
     published = False
     unit = balance = polled = None
     _cycle_state["captcha_rolls"] = 0
+    log.info("cycle=%s begin (interval=%ds, selenium=%s:%s, mqtt=%s)",
+             cycle_id, scrape_interval, selenium_host, selenium_port,
+             "on" if mqtt_enabled else "off")
 
     try:
         mark = time.monotonic()

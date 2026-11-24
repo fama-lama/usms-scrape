@@ -22,7 +22,8 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - **Value checks**: Every field is shape-checked (`… kWh`, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
 - **Retained + QoS 1**: Publishes are retained, so a Home Assistant restart recovers the last values instantly; `home/usms/status` (`ok` / `partial` / `fail`, plus an `offline` last-will) reports scraper health
 - **Debug friendly**: Logs page title, URL and a digit-masked body preview on failure, saves the full page to `/tmp` for layout work, and ends every cycle with one greppable line —
-  `cycle=dc74 result=ok unit='1987.599 kWh' balance='$67.12' polled='24/11/2026' captcha_rolls=1 driver=0.2s login=12.9s scrape=0.1s publish=1.0s total=14.2s`
+  `cycle=dc74 result=ok unit='1987.599 kWh' balance='$67.12' polled='24/11/2026' captcha_rolls=1 driver=0.2s login=12.9s scrape=0.1s publish=1.0s total=14.2s`.
+  `LOG_LEVEL=DEBUG` adds per-navigation timings with page titles, every captcha reading with its inference time, **why** a roll was rejected (`shape: 4 chars, expected 5; agreement 3 < 4`), per-field read latency and per-topic MQTT ack times
 - **Fresh session per cycle**: Creates clean Chrome options and cleans up WebDriver connections every cycle to prevent long-running connection leaks
 - **Quiet logs on any host**: ONNX Runtime's CPU thread affinity is disabled with explicit thread counts, so containers with a restricted or scattered CPU set (LXC coresets, `--cpuset-cpus`, Kubernetes, WSL2) no longer print `pthread_setaffinity_np failed … error code: 22` on every start
 
