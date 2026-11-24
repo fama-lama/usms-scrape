@@ -69,26 +69,29 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 ```yaml
 services:
   usms-scrape:
+    # Always use a published tag: :stable (current release) or a v* version tag.
+    # The :latest tag is not kept up to date, so pin :stable instead.
     image: famalama/usms-scrape:stable
-    restart: unless-stopped
+    restart: unless-stopped          # survive a host reboot and the built-in auto-heal exit
     container_name: usms-scrape
     environment:
-      - USMS_USERNAME=01234567 #CHANGE 
-      - USMS_PASSWORD=PASSWORD123! #CHANGE
-      - SELENIUM_HOST=selenium 
-      - SELENIUM_PORT=4444 
+      - USMS_USERNAME=01234567 #CHANGE (your IC number, as used on the USMS portal)
+      - USMS_PASSWORD=PASSWORD123! #CHANGE (your USMS portal password)
+      - SELENIUM_HOST=selenium        # must match the browser service name below
+      - SELENIUM_PORT=4444
+      # The four MQTT_* lines are optional — delete them all if you do not publish to MQTT.
       - MQTT_BROKER=x.x.x.x #CHANGE
       - MQTT_PORT=1883 #CHANGE
       - MQTT_USERNAME=mqttuser #CHANGE
       - MQTT_PASSWORD=mqttpassword #CHANGE
-      - SCRAPE_INTERVAL=1800 #time in seconds between scrape
+      - SCRAPE_INTERVAL=1800          # seconds between scrapes (1800 = every 30 min)
     depends_on:
       selenium:
-        condition: service_healthy
+        condition: service_healthy    # do not start until Chrome answers /wd/hub/status
   selenium:
     image: selenium/standalone-chrome:latest
     container_name: selenium
-    healthcheck:
+    healthcheck:                      # every scrape waits on this check
       test:
         - CMD
         - curl
@@ -99,17 +102,54 @@ services:
       retries: 10
     restart: unless-stopped
     ports:
-      - 4444:4444
+      - 4444:4444                     # Selenium WebDriver endpoint (required)
+      # OPTIONAL — live view of the browser while it works, useful for seeing where
+      # a login or a scrape gets stuck. Uncomment to watch http://<docker-host>:7900
+      # (password defaults to "secret" — see "Watching it run" below).
+      # Not needed for normal operation.
+      # - 7900:7900
+    # OPTIONAL — your own password for that live view. The image default is "secret";
+    # leave both lines commented out to keep the default.
+    # environment:
+    #   - SE_VNC_PASSWORD=change-me
 networks: {}
 
 ```
 
-
 2. Start the container:
 
-```docker-compose up```
+```
+docker compose up -d
+```
+
+3. Follow the first cycle to make sure it worked:
+
+```
+docker compose logs -f usms-scrape
+```
+
+A healthy cycle logs `Login successful`, the three scraped values, and `Published to MQTT.`. A captcha that the OCR cannot read confidently is re-rolled and logged as `Captcha attempt N/10`; if all rolls fail the run is skipped and retried on the next interval, without overwriting your last good sensor values.
 
 The scraper will run automatically, scrape your USMS data every SCRAPE_INTERVAL seconds, and publish to MQTT if configured.
+
+---
+
+## Watching it run (optional)
+
+The scraper drives a real Chrome, so when a login or a scrape looks stuck you can watch the browser instead of guessing from logs.
+
+1. Uncomment `- 7900:7900` in the `selenium` service above and apply it: `docker compose up -d selenium`
+2. Open `http://<docker-host>:7900`
+3. Enter the VNC password — the image default is `secret`, or whatever you set in `SE_VNC_PASSWORD`
+
+The same browser is also listed in the Selenium Grid UI at `http://<docker-host>:4444/ui`.
+
+Notes:
+
+- Both extras are optional. Closed ports are the default and the scraper never needs them.
+- `SE_VNC_PASSWORD` protects this live view only — it is not your USMS password.
+- If you publish `7900`, keep it LAN-only or behind a VPN. Anyone who can reach it can watch and type into a browser that is logged into your meter account.
+- The live view shows the browser, not the OCR: captcha reads are logged as `Captcha attempt N/10: '<code>' (n/5 models agree)`.
 
 ## Home Assistant sensors
 
@@ -118,23 +158,27 @@ insert this code into your configuration.yaml
 ```yaml
 mqtt:
   sensor:
+    # Remaining credit on the meter, published as "2003.508 kWh" -> 2003.508
     - name: USMS Remaining Unit
       state_topic: home/usms/remaining_unit
       value_template: "{{ value.split(' ')[0] }}"
       unit_of_measurement: "kWh"
       state_class: total
 
+    # Account balance, published as "$67.28" -> 67.28
     - name: USMS Remaining Balance
       state_topic: home/usms/remaining_balance
       value_template: "{{ value.replace('$', '') }}"
       unit_of_measurement: "BND"
       state_class: total
- 
+
+    # Date the utility last read the meter (DD/MM/YYYY) — compare with today to spot a stale meter
     - name: USMS Meter Last Polled
       state_topic: home/usms/meter_last_polled
       value_template: "{{ value }}"
 
 
+    # When the scraper last succeeded — stays put when a run fails, so a gap here means the scraper is stuck
     - name: USMS Last Run Time
       state_topic: home/usms/last_run
       value_template: "{{ value | as_datetime('%Y-%m-%d %H:%M:%S') }}"
