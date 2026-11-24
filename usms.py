@@ -1,8 +1,12 @@
 import os
 import io
-import time
+import re
+import sys
 import json
+import time
+import uuid
 import base64
+import signal
 import logging
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -17,42 +21,94 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException, TimeoutException
 
 try:
+    from zoneinfo import ZoneInfo
+except ImportError:      # Python < 3.9
+    ZoneInfo = None
+
+try:
     import paho.mqtt.client as mqtt
 except ImportError:
     mqtt = None  # Optional
 
-# Configure logging
+# ---------------------------------------------------------------------------
+# Logging
+#
+# LOG_LEVEL makes the existing debug detail reachable without a rebuild. An
+# invalid value is reported and ignored rather than crashing the container.
+# ---------------------------------------------------------------------------
+
+_VALID_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
+_log_level_raw = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
+LOG_LEVEL = _log_level_raw if _log_level_raw in _VALID_LEVELS else "INFO"
+
+# The ROOT logger stays at INFO on purpose. selenium/urllib3 emit one debug record
+# per WebDriver HTTP request, and those bodies contain the account password and,
+# on the login page, the IC number. LOG_LEVEL raises only this application's
+# logger, so its own debug detail becomes readable without shipping credentials
+# into the container log (verified live: urllib3 debug leaked both).
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("usms")
+log.setLevel(getattr(logging, LOG_LEVEL))
 
-# Read config from environment variables
-usms_username = os.getenv("USMS_USERNAME")
-usms_password = os.getenv("USMS_PASSWORD")
-selenium_host = os.getenv("SELENIUM_HOST", "localhost")
-selenium_port = os.getenv("SELENIUM_PORT", "4444")
+if LOG_LEVEL != _log_level_raw:
+    log.warning("LOG_LEVEL=%r is not a logging level — using INFO.", _log_level_raw)
 
-mqtt_broker = os.getenv("MQTT_BROKER")
-mqtt_port_str = os.getenv("MQTT_PORT")
-mqtt_username = os.getenv("MQTT_USERNAME")
-mqtt_password = os.getenv("MQTT_PASSWORD")
 
-try:
-    mqtt_port = int(mqtt_port_str) if mqtt_port_str and mqtt_port_str.isdigit() else 1883
-except ValueError:
-    mqtt_port = 1883
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Parsing is deliberately side-effect free: a bad value is carried through as a
+# sentinel and reported by validate_config() with one actionable line, instead
+# of raising ValueError at import time and crash-looping with a traceback.
+# ---------------------------------------------------------------------------
 
-scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "1800"))
+_INVALID = object()
 
-mqtt_enabled = all([mqtt_broker, mqtt_username, mqtt_password]) and mqtt is not None
+
+def _env_text(name, default=None):
+    """Env value, stripped; empty is the same as unset."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw or default
+
+
+def _env_int(name, default):
+    """Env value as int, or the _INVALID sentinel — never raises."""
+    raw = _env_text(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return _INVALID
+
+
+usms_username = _env_text("USMS_USERNAME")
+usms_password = _env_text("USMS_PASSWORD")
+selenium_host = _env_text("SELENIUM_HOST", "localhost")
+selenium_port = _env_int("SELENIUM_PORT", 4444)
+
+mqtt_broker = _env_text("MQTT_BROKER")
+mqtt_port = _env_int("MQTT_PORT", 1883)
+mqtt_username = _env_text("MQTT_USERNAME")
+mqtt_password = _env_text("MQTT_PASSWORD")
+
+scrape_interval = _env_int("SCRAPE_INTERVAL", 1800)
+
+# A broker URL is the only thing MQTT needs: anonymous brokers are legitimate.
+mqtt_enabled = bool(mqtt_broker) and mqtt is not None
 
 # MQTT topics
 topic_unit = "home/usms/remaining_unit"
 topic_balance = "home/usms/remaining_balance"
 topic_polled = "home/usms/meter_last_polled"
 topic_lastrun = "home/usms/last_run"
+topic_status = "home/usms/status"
 
 # Dashboard page and XPaths for the data table rows
 DASHBOARD_URL = "https://www.usms.com.bn/SmartMeter/Home"
@@ -64,6 +120,96 @@ XPATH_BALANCE = "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1
 XPATH_POLLED = "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div/table/tbody/tr[11]/td/table/tbody/tr/td[2]"
 # The outer container div (used for login detection and as anchor for waiting)
 XPATH_DASHBOARD_DIV = "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/tr/td[1]/div"
+
+# --- Operational limits -----------------------------------------------------
+MIN_SCRAPE_INTERVAL = 60      # seconds; below this the portal is being hammered
+MAX_CONSECUTIVE_FAILURES = 3  # then exit(1) and let the restart policy recycle us
+PAGE_LOAD_TIMEOUT = 45        # seconds per navigation (chromedriver defaults to 300)
+ELEMENT_TIMEOUT = 10          # seconds per dashboard cell
+SCRAPE_RETRY_SLEEP = 5        # seconds before the single retry pass
+SELENIUM_ATTEMPTS = 5
+SELENIUM_RETRY_SLEEP = 3
+CAPTCHA_REFRESH_TIMEOUT = 5.0  # seconds to wait for a re-rolled captcha image
+
+
+# ---------------------------------------------------------------------------
+# Timezone
+#
+# The portal's timestamps are local (Asia/Brunei, UTC+8). ZoneInfo is used when
+# the platform has tzdata; the fixed offset is the documented fallback so a slim
+# image without tzdata still stamps the same wall-clock time.
+# ---------------------------------------------------------------------------
+
+USMS_TIMEZONE = _env_text("USMS_TIMEZONE", "Asia/Brunei")
+
+
+def local_timezone():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(USMS_TIMEZONE)
+        except Exception as e:
+            log.warning("USMS_TIMEZONE=%r is unknown to this platform (%s) — "
+                        "falling back to UTC+8.", USMS_TIMEZONE, e)
+    return timezone(timedelta(hours=8))
+
+
+def now_stamp():
+    return datetime.now(local_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def validate_config():
+    """Fail fast, in one log line per problem, when the environment is unusable."""
+    problems = []
+
+    if scrape_interval is _INVALID:
+        problems.append("SCRAPE_INTERVAL must be a whole number of seconds, got %r"
+                        % os.getenv("SCRAPE_INTERVAL"))
+    elif scrape_interval < MIN_SCRAPE_INTERVAL:
+        problems.append("SCRAPE_INTERVAL=%ds is below the %ds floor — refusing to "
+                        "hammer the portal" % (scrape_interval, MIN_SCRAPE_INTERVAL))
+
+    for label, value in (("SELENIUM_PORT", selenium_port), ("MQTT_PORT", mqtt_port)):
+        if value is _INVALID:
+            problems.append("%s must be a whole number, got %r" % (label, os.getenv(label)))
+        elif not 0 < value < 65536:
+            problems.append("%s=%s is not a valid TCP port" % (label, value))
+
+    if not usms_username:
+        problems.append("USMS_USERNAME is empty — set it in the stack's environment")
+    if not usms_password:
+        problems.append("USMS_PASSWORD is empty — set it in the stack's environment")
+
+    if mqtt_broker and mqtt is None:
+        problems.append("MQTT_BROKER is set but paho-mqtt is not installed")
+
+    if problems:
+        for problem in problems:
+            log.critical("config: %s", problem)
+        log.critical("Refusing to start with an unusable configuration.")
+        sys.exit(2)
+
+
+def mqtt_disabled_reason():
+    if mqtt is None:
+        return "paho-mqtt not installed"
+    if not mqtt_broker:
+        return "MQTT_BROKER not set"
+    return ""
+
+
+def log_startup_config():
+    """Echo the RESOLVED configuration — never the credential values."""
+    log.info(
+        "config: interval=%ds selenium=%s:%s mqtt=%s (%s) credentials username=%s "
+        "password=%s log_level=%s timezone=%s ort_threads=%d",
+        scrape_interval, selenium_host, selenium_port,
+        "on" if mqtt_enabled else "off",
+        f"{mqtt_broker}:{mqtt_port}" if mqtt_broker else mqtt_disabled_reason(),
+        "set" if usms_username else "MISSING",
+        "set" if usms_password else "MISSING",
+        LOG_LEVEL, USMS_TIMEZONE,
+        max(1, min(ORT_MAX_THREADS, _available_cpus())),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +231,9 @@ CAPTCHA_MIN_VOTES = 4      # of 5 readings
 CAPTCHA_MAX_ROLLS = 10     # re-roll budget per login attempt
 CAPTCHA_CODE_LENGTH = 5
 _captcha_engines = None
+
+# Per-cycle counters, so the summary line can report them.
+_cycle_state = {"captcha_rolls": 0}
 
 # ---------------------------------------------------------------------------
 # ONNX Runtime thread affinity
@@ -209,7 +358,7 @@ def _valid_code(code):
 
 # The captcha image URL 404s once the browser has rendered it, so pull the bytes
 # back out of Chrome's HTTP cache instead of asking the server again.
-_STEAL_CAPTCHA_JS = """
+STEAL_CAPTCHA_JS = """
 const cb = arguments[arguments.length - 1];
 const img = document.getElementById('ASPxRoundPanel1_ASPxCaptcha1_IMG');
 if (!img) { cb([null, 'captcha image element not present']); }
@@ -223,38 +372,116 @@ else {
 }
 """
 
+CAPTCHA_IMG_ID = "ASPxRoundPanel1_ASPxCaptcha1_IMG"
+CAPTCHA_REFRESH_SELECTOR = "[id$='ASPxCaptcha1_RB']"
 
-def _captcha_png(driver):
-    res = driver.execute_async_script(_STEAL_CAPTCHA_JS)
-    if not res or not res[0] or not isinstance(res[2], str):
-        log.debug("Captcha image unavailable: %s", res)
+
+def _captcha_src(driver):
+    """Current captcha image URL, or None. The URL changes on every re-roll."""
+    try:
+        return driver.find_element(By.ID, CAPTCHA_IMG_ID).get_attribute("src")
+    except Exception:
         return None
-    data = base64.b64decode(res[2])
+
+
+def _captcha_png(driver, attempt=0):
+    """Captcha bytes out of Chrome's HTTP cache, or None.
+
+    The page script has three failure shapes: a 2-element callback
+    ([src, 'reason']), a null src, or a non-PNG payload. All of them must be
+    survivable — a rejected captcha fetch once cost the whole login because the
+    tuple was indexed blind.
+    """
+    try:
+        res = driver.execute_async_script(STEAL_CAPTCHA_JS)
+    except Exception as e:
+        log.warning("Captcha attempt %d: cache read failed: %s: %s",
+                    attempt, type(e).__name__, e)
+        return None
+
+    # A JS callback should be a tuple, but nothing guarantees the shape: index
+    # only after proving it is a sequence of at least three entries.
+    if (not isinstance(res, (list, tuple)) or len(res) < 3
+            or not res[0] or not isinstance(res[2], str)):
+        detail = res[1] if isinstance(res, (list, tuple)) and len(res) > 1 else res
+        log.warning("Captcha attempt %d: image unavailable (%s)", attempt, detail)
+        return None
+
+    try:
+        data = base64.b64decode(res[2])
+    except Exception as e:
+        log.warning("Captcha attempt %d: payload was not base64 (%s)", attempt, e)
+        return None
+
     if not data.startswith(b"\x89PNG"):
-        log.debug("Captcha payload was not a PNG (%d bytes)", len(data))
+        log.warning("Captcha attempt %d: payload was not a PNG (%d bytes)", attempt, len(data))
         return None
     return data
 
 
+def _refresh_captcha(driver, previous_src):
+    """Click "Show another code" and wait for the image URL to actually change.
+
+    Without the src comparison the loop could re-read the same cached image ten
+    times (refresh control missing) or read it before DevExpress swapped it
+    (fixed sleep). Both looked like "the OCR is bad" in the logs.
+    """
+    refresh = driver.find_elements(By.CSS_SELECTOR, CAPTCHA_REFRESH_SELECTOR)
+    if not refresh:
+        log.warning("Captcha refresh control %s not found — a re-roll cannot change "
+                    "the image, stopping here.", CAPTCHA_REFRESH_SELECTOR)
+        return False
+
+    driver.execute_script("arguments[0].click();", refresh[0])
+
+    if not previous_src:
+        time.sleep(1)
+        return True
+
+    deadline = time.monotonic() + CAPTCHA_REFRESH_TIMEOUT
+    while time.monotonic() < deadline:
+        if _captcha_src(driver) != previous_src:
+            return True
+        time.sleep(0.2)
+
+    log.warning("Captcha image did not change within %.1fs of the refresh click",
+                CAPTCHA_REFRESH_TIMEOUT)
+    return False
+
+
 def solve_captcha(driver):
     """Read the stage-2 captcha, re-rolling until the OCR models agree."""
-    for attempt in range(CAPTCHA_MAX_ROLLS):
-        png = _captcha_png(driver)
+    for attempt in range(1, CAPTCHA_MAX_ROLLS + 1):
+        _cycle_state["captcha_rolls"] = attempt
+        src_before = _captcha_src(driver)
+        png = _captcha_png(driver, attempt)
         if png:
-            readings = _read_captcha_variants(png)
-            code, votes = Counter(readings.values()).most_common(1)[0]
-            log.info("Captcha attempt %d/%d: %r (%d/5 models agree) %s",
-                     attempt + 1, CAPTCHA_MAX_ROLLS, code, votes, json.dumps(readings))
-            if _valid_code(code) and votes >= CAPTCHA_MIN_VOTES:
-                return code
+            try:
+                readings = _read_captcha_variants(png)
+            except Exception as e:
+                log.warning("Captcha attempt %d: OCR failed: %s: %s",
+                            attempt, type(e).__name__, e)
+                readings = {}
+            if readings:
+                code, votes = Counter(readings.values()).most_common(1)[0]
+                log.info("Captcha attempt %d/%d: %r (%d/5 models agree) %s",
+                         attempt, CAPTCHA_MAX_ROLLS, code, votes, json.dumps(readings))
+                if _valid_code(code) and votes >= CAPTCHA_MIN_VOTES:
+                    return code
+
         # Disagreement or unreadable: ask for a new challenge instead of guessing.
-        refresh = driver.find_elements(By.CSS_SELECTOR, "[id$='ASPxCaptcha1_RB']")
-        if refresh:
-            driver.execute_script("arguments[0].click();", refresh[0])
-        time.sleep(2)
-    log.warning("Gave up reading the captcha after %d attempts.", CAPTCHA_MAX_ROLLS)
+        if attempt == CAPTCHA_MAX_ROLLS:
+            break
+        if not _refresh_captcha(driver, src_before):
+            break
+
+    log.warning("Gave up reading the captcha after %d attempts.", _cycle_state["captcha_rolls"])
     return None
 
+
+# ---------------------------------------------------------------------------
+# WebDriver
+# ---------------------------------------------------------------------------
 
 # Configure Selenium options — fresh options each session to avoid shared state
 def make_chrome_options():
@@ -266,43 +493,105 @@ def make_chrome_options():
 
 
 def create_driver():
-    """Create a new remote WebDriver session, retrying up to 5 times."""
+    """Create a new remote WebDriver session, retrying up to SELENIUM_ATTEMPTS.
+
+    The catch is deliberately broad: a refused connection to the Selenium
+    container raises urllib3 MaxRetryError/NewConnectionError, which is NOT a
+    WebDriverException. Catching only WebDriverException made the retry loop dead
+    code in exactly the case it exists for (Selenium down).
+    """
     last_exc = None
-    for attempt in range(5):
+    for attempt in range(1, SELENIUM_ATTEMPTS + 1):
         try:
             driver = webdriver.Remote(
                 command_executor=f"http://{selenium_host}:{selenium_port}/wd/hub",
-                options=make_chrome_options()
+                options=make_chrome_options(),
             )
-            driver.set_script_timeout(30)  # needed by the captcha cache read
+            driver.set_script_timeout(30)               # needed by the captcha cache read
+            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+            log.info("WebDriver session ready (attempt %d/%d)", attempt, SELENIUM_ATTEMPTS)
             return driver
-        except WebDriverException as e:
+        except Exception as e:
             last_exc = e
-            log.warning(f"Selenium not ready yet (attempt {attempt + 1}/5): {e}")
-            time.sleep(3)
-    raise RuntimeError(f"Selenium host not reachable after retries: {last_exc}")
+            log.warning("Selenium not ready yet (attempt %d/%d): %s: %s",
+                        attempt, SELENIUM_ATTEMPTS, type(e).__name__, e)
+            if attempt < SELENIUM_ATTEMPTS:
+                time.sleep(SELENIUM_RETRY_SLEEP)
+    raise RuntimeError(
+        f"Selenium host not reachable after {SELENIUM_ATTEMPTS} attempts: "
+        f"{type(last_exc).__name__}: {last_exc}")
 
 
-def _log_page_source(driver, label=""):
-    """Log what USMS actually returned — invaluable for debugging."""
+def _navigate(driver, url, what, cycle_id="none"):
+    """driver.get() with the page-load timeout turned into a log line, not a hang."""
+    try:
+        driver.get(url)
+        return True
+    except TimeoutException:
+        log.warning("cycle=%s %s did not finish loading within %ss — using whatever "
+                    "rendered.", cycle_id, what, PAGE_LOAD_TIMEOUT)
+        return False
+
+
+_DIGITS = re.compile(r"\d")
+
+
+def _mask_digits(text):
+    """Blank out digit runs — the login body carries the account holder's IC number."""
+    return _DIGITS.sub("#", text or "")
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", (text or "page").lower()).strip("-")[:40] or "page"
+
+
+def log_page_source(driver, label="", cycle_id="none"):
+    """Log what USMS actually returned and keep the full DOM for a layout change.
+
+    The 500-char preview is enough to spot a redirect, not enough to fix a
+    shifted table; the whole page is written next to it. Digits are masked in the
+    log line only — the file keeps real values so XPath work stays possible.
+    """
     try:
         title = driver.title
         url = driver.current_url
-        body_snippet = driver.find_element(By.TAG_NAME, "body").text[:500]
-        log.warning("%s — Page title: %s | URL: %s | Body preview: %s",
-                     label or "Page state", title, url, body_snippet)
     except Exception as e:
-        log.warning("Could not capture page source for %s: %s", label, e)
+        log.warning("cycle=%s %s — could not read title/url: %s", cycle_id, label, e)
+        return
 
-
-def is_logged_in(driver):
-    driver.get(DASHBOARD_URL)
     try:
-        driver.find_element(By.XPATH, XPATH_DASHBOARD_DIV)
-        log.info("Already logged in.")
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+        log.warning("cycle=%s %s — title: %s | url: %s | body (digits masked): %s",
+                    cycle_id, label or "Page state", title, url, _mask_digits(body[:500]))
+    except Exception as e:
+        log.warning("cycle=%s %s — could not read the body: %s", cycle_id, label, e)
+
+    try:
+        path = f"/tmp/usms-fail-{cycle_id}-{_slug(label)}.html"
+        html = driver.page_source or ""
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        log.warning("cycle=%s %s — full page saved to %s (%d bytes)",
+                    cycle_id, label, path, len(html))
+    except Exception as e:
+        log.warning("cycle=%s %s — could not save the page source: %s", cycle_id, label, e)
+
+
+def is_logged_in(driver, cycle_id="none"):
+    """True when the dashboard is reachable without a login.
+
+    A WebDriver-level failure is NOT "not logged in" — it propagates, so the cycle
+    handler logs a traceback instead of quietly attempting a login on a dead
+    session.
+    """
+    _navigate(driver, DASHBOARD_URL, "dashboard (session probe)", cycle_id)
+    try:
+        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+            EC.presence_of_element_located((By.XPATH, XPATH_DASHBOARD_DIV)))
+        log.info("cycle=%s session still valid — already logged in.", cycle_id)
         return True
-    except Exception:
-        log.info("Not logged in.")
+    except TimeoutException:
+        log.info("cycle=%s dashboard not present — needs a login.", cycle_id)
         return False
 
 
@@ -319,7 +608,7 @@ def _type(driver, css_selector, text):
     el.send_keys(text)
 
 
-def login(driver):
+def login(driver, cycle_id="none"):
     """Two-stage login.
 
     Stage 1 is the plain form (IC + password) — it carries no captcha for a human.
@@ -327,11 +616,19 @@ def login(driver):
     password AGAIN plus a captcha. The captcha is solved by OCR (see above) and the
     second form is submitted, which lands on /MainPage.
     """
-    log.info("Logging in…")
-    driver.get(LOGIN_URL)
+    log.info("cycle=%s logging in…", cycle_id)
+    _navigate(driver, LOGIN_URL, "login page", cycle_id)
 
-    WebDriverWait(driver, 20).until(
-        EC.presence_of_element_located((By.ID, "ASPxRoundPanel1_txtUsername_I")))
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "ASPxRoundPanel1_txtUsername_I")))
+    except TimeoutException:
+        # This was the one failure path that produced no page dump at all.
+        log.warning("cycle=%s stage-1 login form never appeared — dumping page state.",
+                    cycle_id)
+        log_page_source(driver, "Stage 1 form missing", cycle_id)
+        return False
+
     _type(driver, "#ASPxRoundPanel1_txtUsername_I", usms_username)
     _type(driver, "#ASPxRoundPanel1_txtPassword_I", usms_password)
     _click(driver, "#ASPxRoundPanel1_btnLogin")
@@ -341,24 +638,28 @@ def login(driver):
         WebDriverWait(driver, 30).until(
             lambda d: "sc=" in d.current_url or "ResLogin" not in d.current_url)
     except TimeoutException:
-        log.warning("No response to the stage-1 submit — dumping page state.")
-        _log_page_source(driver, "After stage 1 timeout")
+        log.warning("cycle=%s no response to the stage-1 submit — dumping page state.",
+                    cycle_id)
+        log_page_source(driver, "After stage 1 timeout", cycle_id)
         return False
 
     if "sc=" not in driver.current_url:
-        log.info("Login succeeded without a captcha stage — landed on %s", driver.current_url)
+        log.info("cycle=%s login succeeded without a captcha stage — landed on %s",
+                 cycle_id, driver.current_url)
         return True
 
-    log.info("Stage 1 accepted; solving the stage-2 captcha on %s", driver.current_url)
+    log.info("cycle=%s stage 1 accepted; solving the stage-2 captcha on %s",
+             cycle_id, driver.current_url)
     code = solve_captcha(driver)
     if not code:
-        _log_page_source(driver, "Captcha unreadable")
+        log_page_source(driver, "Captcha unreadable", cycle_id)
         return False
 
     # Fill stage 2: same credentials again, plus the solved captcha.
     tb = driver.find_elements(By.CSS_SELECTOR, "[name$='ASPxCaptcha1$TB']")
     if not tb:
-        log.warning("Stage-2 captcha input field not found.")
+        log.warning("cycle=%s stage-2 captcha input field not found.", cycle_id)
+        log_page_source(driver, "Stage 2 captcha input missing", cycle_id)
         return False
     driver.execute_script("arguments[0].focus();", tb[0])
     tb[0].send_keys(code)
@@ -374,136 +675,345 @@ def login(driver):
     try:
         WebDriverWait(driver, 30).until(lambda d: "ResLogin" not in d.current_url)
     except TimeoutException:
-        log.warning("Dashboard did not appear after the stage-2 submit — dumping page state.")
-        _log_page_source(driver, "After stage 2 timeout")
+        log.warning("cycle=%s dashboard did not appear after the stage-2 submit — "
+                    "dumping page state.", cycle_id)
+        log_page_source(driver, "After stage 2 timeout", cycle_id)
         return False
 
-    log.info("Login successful — dashboard loaded at %s", driver.current_url)
+    log.info("cycle=%s login successful — dashboard loaded at %s", cycle_id, driver.current_url)
     return True
 
 
-def safe_get_text(driver, xpath, timeout=10):
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
+
+def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT):
+    """Text of one element, or None.
+
+    Waits for NON-EMPTY text, not merely for the element to exist: a present but
+    empty cell used to return '' which every N/A guard then let through.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while True:
+        try:
+            text = (driver.find_element(By.XPATH, xpath).text or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            last_error = e
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+
+    if last_error is not None:
+        log.warning("No text in %s within %ss (last error: %s)", xpath, timeout, last_error)
+    else:
+        log.warning("Element %s stayed empty for %ss", xpath, timeout)
+    return None
+
+
+# Value shapes. The dashboard cells are read by absolute XPath, so inserting one
+# table row resolves every offset to the WRONG cell and would publish it happily
+# forever. A shape check turns that silent corruption into a warning.
+_FIELD_SHAPES = {
+    "unit": (re.compile(r"^\d[\d,]*(?:\.\d+)?\s*kWh$", re.I), "a kWh reading, e.g. 1991.264 kWh"),
+    "balance": (re.compile(r"^(?:RM|BND|\$)?\s*\d[\d,]*(?:\.\d+)?$", re.I),
+                "an amount, e.g. $67.16"),
+    "polled": (re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$"), "a date, e.g. 24/11/2026"),
+}
+
+
+def validate_value(field, value):
+    """value when it matches the field's shape, otherwise None (treated as N/A)."""
+    if value is None:
+        return None
+    pattern, hint = _FIELD_SHAPES[field]
+    if pattern.match(value):
+        return value
+    log.warning("%s = %r does not look like %s — treating this field as unavailable.",
+                field, value, hint)
+    return None
+
+
+def _read_dashboard(driver, timeout=ELEMENT_TIMEOUT):
+    return {
+        "unit": validate_value("unit", safe_get_text(driver, XPATH_UNIT, timeout)),
+        "balance": validate_value("balance", safe_get_text(driver, XPATH_BALANCE, timeout)),
+        "polled": validate_value("polled", safe_get_text(driver, XPATH_POLLED, timeout)),
+    }
+
+
+def scrape_data(driver, cycle_id="none"):
+    """(unit, balance, polled, run_time) — any unavailable field is None."""
+    log.info("cycle=%s scraping dashboard…", cycle_id)
+    _navigate(driver, DASHBOARD_URL, "dashboard", cycle_id)
+
+    values = _read_dashboard(driver)
+    missing = [name for name, value in values.items() if value is None]
+
+    if missing:
+        log_page_source(driver, f"Incomplete scrape (missing {','.join(missing)})", cycle_id)
+        log.info("cycle=%s retrying the scrape after a refresh — missing: %s",
+                 cycle_id, ", ".join(missing))
+        time.sleep(SCRAPE_RETRY_SLEEP)
+        _navigate(driver, DASHBOARD_URL, "dashboard (retry)", cycle_id)
+        for name, value in _read_dashboard(driver, timeout=ELEMENT_TIMEOUT + 5).items():
+            if values[name] is None and value is not None:
+                values[name] = value
+                log.info("cycle=%s %s recovered on the retry: %r", cycle_id, name, value)
+        missing = [name for name, value in values.items() if value is None]
+        if missing:
+            log.warning("cycle=%s still missing after the retry: %s",
+                        cycle_id, ", ".join(missing))
+
+    run_time = now_stamp()
+    log.info("cycle=%s unit=%s | balance=%s | last polled=%s | time=%s",
+             cycle_id,
+             values["unit"] or "N/A", values["balance"] or "N/A",
+             values["polled"] or "N/A", run_time)
+    return values["unit"], values["balance"], values["polled"], run_time
+
+
+# ---------------------------------------------------------------------------
+# MQTT
+# ---------------------------------------------------------------------------
+
+def result_status(unit, balance, polled):
+    present = sum(1 for value in (unit, balance, polled) if value)
+    if present == 3:
+        return "ok"
+    if present:
+        return "partial"
+    return "fail"
+
+
+def _publish_topic(client, topic, value, cycle_id):
+    """Publish one retained QoS-1 value and report whether the broker took it."""
     try:
-        el = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.XPATH, xpath))
-        )
-        return el.text.strip()
-    except TimeoutException:
-        log.warning(f"Element not found within {timeout}s: {xpath}")
-        return "N/A"
+        info = client.publish(topic, value, qos=1, retain=True)
+        info.wait_for_publish(timeout=5)
     except Exception as e:
-        log.warning(f"Failed to find element {xpath}: {e}")
-        return "N/A"
+        log.warning("cycle=%s mqtt %s NOT published: %s: %s",
+                    cycle_id, topic, type(e).__name__, e)
+        return False
+
+    rc = getattr(info, "rc", None)
+    is_published = getattr(info, "is_published", None)
+    confirmed = is_published() if callable(is_published) else True
+    if rc == mqtt.MQTT_ERR_SUCCESS and confirmed:
+        log.info("cycle=%s mqtt %s = %r (qos=1 retain)", cycle_id, topic, value)
+        return True
+
+    log.warning("cycle=%s mqtt %s NOT published (rc=%s published=%s)",
+                cycle_id, topic, rc, confirmed)
+    return False
 
 
-def scrape_data(driver):
-    log.info("Scraping dashboard…")
-    driver.get(DASHBOARD_URL)
+def publish_mqtt(unit, balance, polled, run_time, cycle_id="none"):
+    """Publish what validated, plus a status topic. True only on a complete cycle.
 
-    unit = safe_get_text(driver, XPATH_UNIT)
-    balance = safe_get_text(driver, XPATH_BALANCE)
-    polled = safe_get_text(driver, XPATH_POLLED)
-    run_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    Only fields that actually validated are published: a partial scrape used to
+    overwrite a good HA sensor with the literal string "N/A", which silently
+    breaks that sensor's statistics while the other two keep updating. A skipped
+    publish leaves the last retained value in place, and last_run only advances on
+    a complete cycle so HA can alert on a stale scraper.
+    """
+    status = result_status(unit, balance, polled)
 
-    log.info(f"Unit: {unit}, Balance: {balance}, Last Polled: {polled}, Time: {run_time}")
-
-    # If all three values are N/A, the page structure is likely wrong — log a debug dump
-    if unit == "N/A" and balance == "N/A" and polled == "N/A":
-        _log_page_source(driver, "All values N/A")
-        # Retry once: refresh and wait a bit longer
-        log.info("Retrying scrape after refresh…")
-        time.sleep(5)
-        driver.get(DASHBOARD_URL)
-        unit = safe_get_text(driver, XPATH_UNIT, timeout=15)
-        balance = safe_get_text(driver, XPATH_BALANCE, timeout=15)
-        polled = safe_get_text(driver, XPATH_POLLED, timeout=15)
-        run_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-        log.info(f"Retry result — Unit: {unit}, Balance: {balance}, Last Polled: {polled}")
-
-    return unit, balance, polled, run_time
-
-
-def publish_mqtt(unit, balance, polled, run_time):
     if not mqtt_enabled:
-        log.info("MQTT not configured, skipping publish.")
-        return
+        log.info("cycle=%s mqtt disabled (%s) — status=%s, nothing published",
+                 cycle_id, mqtt_disabled_reason(), status)
+        return status == "ok"
 
-    # Don't overwrite good sensor data with N/A — skip publish on failure
-    if unit == "N/A" and balance == "N/A" and polled == "N/A":
-        log.warning("All values N/A — skipping MQTT publish to preserve last good sensor data.")
-        return
-
+    client = None
+    published = {}
     try:
         client = mqtt.Client(  # type: ignore[union-attr] — guarded by mqtt_enabled above
             client_id="",
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[union-attr]
             protocol=mqtt.MQTTv5,  # type: ignore[union-attr]
         )
-        client.username_pw_set(mqtt_username, mqtt_password)
-        client.connect(mqtt_broker, mqtt_port, 60)
-        client.publish(topic_unit, unit)
-        client.publish(topic_balance, balance)
-        client.publish(topic_polled, polled)
-        client.publish(topic_lastrun, run_time)
-        log.info("Published to MQTT.")
-        client.disconnect()
+        if mqtt_username:
+            client.username_pw_set(mqtt_username, mqtt_password)
+        # Last will: if this container dies, HA sees "offline" instead of stale data.
+        client.will_set(topic_status, "offline", qos=1, retain=True)
+
+        rc = client.connect(mqtt_broker, mqtt_port, 60)
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            log.error("cycle=%s mqtt connect to %s:%s returned rc=%s",
+                      cycle_id, mqtt_broker, mqtt_port, rc)
+            return False
+
+        client.loop_start()
+        published["unit"] = _publish_topic(client, topic_unit, unit, cycle_id) if unit else False
+        published["balance"] = (
+            _publish_topic(client, topic_balance, balance, cycle_id) if balance else False)
+        published["polled"] = (
+            _publish_topic(client, topic_polled, polled, cycle_id) if polled else False)
+
+        if status == "ok":
+            published["last_run"] = _publish_topic(client, topic_lastrun, run_time, cycle_id)
+        else:
+            # Deliberately stale: HA's staleness alarm is the signal.
+            log.info("cycle=%s not advancing %s — cycle was %s",
+                     cycle_id, topic_lastrun, status)
+
+        published["status"] = _publish_topic(client, topic_status, status, cycle_id)
     except Exception as e:
-        log.error(f"MQTT error: {e}")
+        log.error("cycle=%s mqtt error: %s: %s", cycle_id, type(e).__name__, e)
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception as e:
+                log.debug("cycle=%s mqtt close warning: %s", cycle_id, e)
+
+    ok = status == "ok" and all(published.values())
+    log.info("cycle=%s mqtt status=%s per-topic=%s", cycle_id, status, json.dumps(published))
+    return ok
 
 
 def print_summary(unit, balance, polled, run_time):
     print("\n=== USMS Data Summary ===")
-    print(f"Remaining Unit    : {unit}")
-    print(f"Remaining Balance : {balance}")
-    print(f"Meter Last Polled : {polled}")
+    print(f"Remaining Unit    : {unit or 'N/A'}")
+    print(f"Remaining Balance : {balance or 'N/A'}")
+    print(f"Meter Last Polled : {polled or 'N/A'}")
     print(f"Last Run Time     : {run_time}")
     print("========================\n")
 
 
-# === MAIN LOOP ===
-log.info("USMS Scrape starting up.")
-failure_count = 0
+# ---------------------------------------------------------------------------
+# One cycle + the supervisor loop
+# ---------------------------------------------------------------------------
 
-while True:
+def log_cycle_summary(cycle_id, status, unit, balance, polled, timings, total):
+    """One greppable line that answers: which cycle, how slow, what happened."""
+    log.info(
+        "cycle=%s result=%s unit=%r balance=%r polled=%r captcha_rolls=%d "
+        "driver=%.1fs login=%.1fs scrape=%.1fs publish=%.1fs total=%.1fs",
+        cycle_id, status, unit, balance, polled, _cycle_state["captcha_rolls"],
+        timings.get("driver", 0.0), timings.get("login", 0.0),
+        timings.get("scrape", 0.0), timings.get("publish", 0.0), total,
+    )
+
+
+def run_cycle(cycle_id="none"):
+    """One scrape cycle. Returns {'status': ok|partial|fail, 'published': bool}."""
     driver = None
+    started = time.monotonic()
+    timings = {}
+    status = "fail"
+    published = False
+    unit = balance = polled = None
+    _cycle_state["captcha_rolls"] = 0
+
     try:
-        # Create a fresh WebDriver session for this cycle
+        mark = time.monotonic()
         driver = create_driver()
+        timings["driver"] = time.monotonic() - mark
 
-        if not is_logged_in(driver):
-            login(driver)
+        mark = time.monotonic()
+        if not is_logged_in(driver, cycle_id) and not login(driver, cycle_id):
+            # A login that returned False is a failure, not a reason to scrape.
+            raise RuntimeError("login failed")
+        timings["login"] = time.monotonic() - mark
 
-        unit, balance, polled, run_time = scrape_data(driver)
+        mark = time.monotonic()
+        unit, balance, polled, run_time = scrape_data(driver, cycle_id)
+        timings["scrape"] = time.monotonic() - mark
+        status = result_status(unit, balance, polled)
 
-        # Track consecutive failures vs successes
-        if unit == "N/A" and balance == "N/A" and polled == "N/A":
-            failure_count += 1
-        else:
-            failure_count = 0
-
-        publish_mqtt(unit, balance, polled, run_time)
+        mark = time.monotonic()
+        published = publish_mqtt(unit, balance, polled, run_time, cycle_id)
+        timings["publish"] = time.monotonic() - mark
         print_summary(unit, balance, polled, run_time)
-
-        # Auto-heal: if 3+ consecutive cycles returned N/A, force an exit
-        # so Docker's restart policy (unless-stopped) recycles us cleanly.
-        if failure_count >= 3:
-            log.error(
-                "%d consecutive scrape failures — triggering container restart "
-                "to recover clean Selenium connection.",
-                failure_count,
-            )
-            raise RuntimeError("Too many consecutive failures — restarting.")
-
-    except Exception as e:
-        log.error(f"Error during scrape cycle: {e}")
     finally:
-        if driver:
+        if driver is not None:
             try:
                 driver.quit()
-                log.debug("WebDriver session cleaned up.")
+                log.debug("cycle=%s WebDriver session cleaned up.", cycle_id)
             except Exception as e:
-                # Log cleanup errors instead of swallowing them silently
-                log.warning("WebDriver cleanup warning (non-fatal): %s", e)
+                log.warning("cycle=%s WebDriver cleanup warning (non-fatal): %s", cycle_id, e)
+        log_cycle_summary(cycle_id, status, unit, balance, polled, timings,
+                          time.monotonic() - started)
 
-    log.info(f"Sleeping {scrape_interval}s…")
-    time.sleep(scrape_interval)
+    return {"status": status, "published": published}
+
+
+def install_signal_handlers():
+    """Turn SIGTERM into SystemExit so the finally block quits the WebDriver.
+
+    `docker stop` sends SIGTERM and waits 10 s; without this the process died
+    mid-cycle and left the Chrome session behind, which on
+    SE_NODE_MAX_SESSIONS=1 blocks the next container start.
+    """
+    def _graceful(signum, _frame):
+        log.info("Received signal %s — releasing the WebDriver session and exiting.", signum)
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _graceful)
+        except (ValueError, OSError) as e:
+            log.debug("Could not install a handler for %s: %s", sig, e)
+
+
+# === MAIN LOOP ===
+
+def main():
+    validate_config()
+    log_startup_config()
+    install_signal_handlers()
+    log.info("USMS Scrape starting up.")
+
+    failure_count = 0
+    next_run = time.monotonic()
+
+    while True:
+        cycle_id = uuid.uuid4().hex[:4]
+        next_run += scrape_interval
+
+        try:
+            outcome = run_cycle(cycle_id)
+            cycle_ok = outcome["status"] == "ok" and outcome["published"]
+        except SystemExit:
+            raise
+        except Exception:
+            # exc_info: this is the single funnel for every unexpected failure.
+            log.exception("cycle=%s result=error — unhandled failure", cycle_id)
+            cycle_ok = False
+
+        # Every failure counts, not just an all-N/A scrape: an unreachable
+        # Selenium or a dead portal is exactly what the restart policy is for.
+        failure_count = 0 if cycle_ok else failure_count + 1
+
+        if failure_count >= MAX_CONSECUTIVE_FAILURES:
+            log.error(
+                "cycle=%s %d consecutive failed cycles — exiting so the restart "
+                "policy (unless-stopped) recycles us with a clean Selenium session.",
+                cycle_id, failure_count,
+            )
+            sys.exit(1)
+
+        now = time.monotonic()
+        if next_run <= now:
+            # Overran the interval: run the next cycle after a full interval
+            # rather than firing a catch-up burst at the portal.
+            log.warning("cycle=%s overran its %ds interval — next cycle in %ds",
+                        cycle_id, scrape_interval, scrape_interval)
+            next_run = now + scrape_interval
+
+        sleep_for = max(0.0, next_run - now)
+        log.info("cycle=%s sleeping %.0fs (interval %ds)", cycle_id, sleep_for, scrape_interval)
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Interrupted — stopping.")

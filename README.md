@@ -17,9 +17,12 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - Runs continuously with configurable scrape interval  
 - **Robust login**: Uses `WebDriverWait` instead of blind `time.sleep()` — waits for the dashboard to actually load
 - **Captcha login**: The site's second login stage asks for a captcha. It is read locally by `ddddocr` and only submitted when 4 of 5 OCR passes agree; a disagreement just re-rolls a fresh code, which costs nothing
-- **Smart failure handling**: Skips MQTT publish on all-`N/A` results — preserves last good sensor data in Home Assistant
-- **Auto-heal**: After 3 consecutive scrape failures, the container exits so Docker's `restart: unless-stopped` recycles it cleanly
-- **Debug friendly**: Logs page title, URL, and body text on scrape failure so you can see exactly what the USMS site returned
+- **Smart failure handling**: Publishes only the fields that validated — a partial scrape never overwrites a good Home Assistant sensor with the text `N/A`. Skipped publishes keep the last retained value, and `home/usms/last_run` only advances on a fully successful cycle, so Home Assistant can alert on a *stale* scraper instead of a dead one
+- **Auto-heal**: Any 3 consecutive failed cycles (portal, captcha, Selenium — not just `N/A` results) exit the container so Docker's `restart: unless-stopped` recycles it cleanly
+- **Value checks**: Every field is shape-checked (`… kWh`, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
+- **Retained + QoS 1**: Publishes are retained, so a Home Assistant restart recovers the last values instantly; `home/usms/status` (`ok` / `partial` / `fail`, plus an `offline` last-will) reports scraper health
+- **Debug friendly**: Logs page title, URL and a digit-masked body preview on failure, saves the full page to `/tmp` for layout work, and ends every cycle with one greppable line —
+  `cycle=dc74 result=ok unit='1987.599 kWh' balance='$67.12' polled='24/11/2026' captcha_rolls=1 driver=0.2s login=12.9s scrape=0.1s publish=1.0s total=14.2s`
 - **Fresh session per cycle**: Creates clean Chrome options and cleans up WebDriver connections every cycle to prevent long-running connection leaks
 - **Quiet logs on any host**: ONNX Runtime's CPU thread affinity is disabled with explicit thread counts, so containers with a restricted or scattered CPU set (LXC coresets, `--cpuset-cpus`, Kubernetes, WSL2) no longer print `pthread_setaffinity_np failed … error code: 22` on every start
 
@@ -31,13 +34,18 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
 | `USMS_USERNAME`  | Your USMS Smart Meter account username (Brunei IC number)                                       | Yes      | N/A           |
 | `USMS_PASSWORD`  | Your USMS Smart Meter account password                                                         | Yes      | N/A           |
-| `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `selenium`   |
+| `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `localhost`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
-| `MQTT_BROKER`    | MQTT broker hostname or IP address                                                             | No       | N/A           |
-| `MQTT_PORT`      | MQTT broker port                                                                               | No       | N/A           |
-| `MQTT_USERNAME`  | Username for MQTT broker authentication                                                        | No       | N/A           |
-| `MQTT_PASSWORD`  | Password for MQTT broker authentication                                                        | No       | N/A           |
-| `SCRAPE_INTERVAL`| Time interval between scraping runs in seconds (integer)                                      | Yes       | `1800` (30 min)|
+| `MQTT_BROKER`    | MQTT broker hostname or IP address (MQTT is enabled only when this is set)                      | No       | N/A           |
+| `MQTT_PORT`      | MQTT broker port                                                                               | No       | `1883`        |
+| `MQTT_USERNAME`  | Username for MQTT broker authentication (optional — anonymous brokers work without it)          | No       | N/A           |
+| `MQTT_PASSWORD`  | Password for MQTT broker authentication (optional)                                             | No       | N/A           |
+| `SCRAPE_INTERVAL`| Time interval between scraping runs in seconds (integer, minimum `60`)                          | Yes       | `1800` (30 min)|
+| `LOG_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR` — applies to the scraper's own log lines                    | No       | `INFO`        |
+| `USMS_TIMEZONE`  | IANA timezone for the `last_run` timestamp                                                     | No       | `Asia/Brunei` |
+
+`LOG_LEVEL=DEBUG` deliberately does **not** raise the Selenium/urllib3 loggers: their
+per-request debug records contain the account password and IC number.
 
 ---
 
@@ -47,7 +55,12 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - `home/usms/remaining_unit` — Remaining units on your smart meter  
 - `home/usms/remaining_balance` — Remaining balance in your account  
 - `home/usms/meter_last_polled` — Last meter polling timestamp  
-- `home/usms/last_run` — Timestamp of the last scrape run  
+- `home/usms/last_run` — Timestamp of the last **fully successful** scrape cycle  
+- `home/usms/status` — `ok` (all three fields), `partial` (some), `fail` (none), `offline` (last will)
+
+All topics are published with `retain=True, qos=1`, so a subscriber that starts late still
+receives the last values. A field that fails validation is simply not published — the
+retained value from the previous good cycle stays put.
 
 ---
 
