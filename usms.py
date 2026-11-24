@@ -77,6 +77,56 @@ def _env_text(name, default=None):
     return raw or default
 
 
+def _env_secret(name, default=None):
+    """Credential from <name>, else from the file named by <name>_FILE.
+
+    A compose `environment:` value is INTERPOLATED by Docker Compose before the
+    container exists: a password containing `$` arrives truncated (`$ott` becomes
+    an empty substitution, so `MyP@ss$w0rd` reaches us as `MyP@ss`) and quotes are
+    passed through literally. Compose does this for `environment:`, for `env_file:`
+    and for `.env` alike, and no amount of quoting in the YAML stops it — only
+    `$$` does. A file we read ourselves has no interpolation in front of it, so
+    `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch
+    for those passwords.
+    """
+    value = _env_text(name)
+    if value is not None:
+        return value
+
+    path = _env_text(name + "_FILE")
+    if not path:
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except OSError as e:
+        log.warning("%s_FILE=%s could not be read: %s: %s",
+                    name, path, type(e).__name__, e)
+        return default
+    if text:
+        log.info("%s loaded from %s (%d characters)", name, path, len(text))
+        return text
+    log.warning("%s_FILE=%s is empty", name, path)
+    return default
+
+
+def _unquote_secret(value, name):
+    """Drop ONE matching pair of surrounding quotes, loudly.
+
+    `- USMS_PASSWORD="***"` in a compose list is not YAML quoting: the quotes are
+    part of the value, the container receives them, and the portal rejects the
+    login with no useful error. A real password never starts and ends with the
+    same quote character, so stripping the pair is safe — but a warning is logged
+    so the file gets fixed rather than silently compensated for.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        log.warning("%s is wrapped in %s quotes — those are literal inside a compose "
+                    "environment entry, so the portal would have seen them too. "
+                    "Using the value without them.", name, value[0])
+        return value[1:-1]
+    return value
+
+
 def _env_int(name, default):
     """Env value as int, or the _INVALID sentinel — never raises."""
     raw = _env_text(name)
@@ -88,8 +138,8 @@ def _env_int(name, default):
         return _INVALID
 
 
-usms_username = _env_text("USMS_USERNAME")
-usms_password = _env_text("USMS_PASSWORD")
+usms_username = _unquote_secret(_env_secret("USMS_USERNAME") or "", "USMS_USERNAME")
+usms_password = _unquote_secret(_env_secret("USMS_PASSWORD") or "", "USMS_PASSWORD")
 selenium_host = _env_text("SELENIUM_HOST", "localhost")
 selenium_port = _env_int("SELENIUM_PORT", 4444)
 
@@ -178,6 +228,16 @@ def validate_config():
         problems.append("USMS_USERNAME is empty — set it in the stack's environment")
     if not usms_password:
         problems.append("USMS_PASSWORD is empty — set it in the stack's environment")
+
+    # A `$` in an environment-supplied password is the single most common cause
+    # of "Incorrect user name and password" on a password that works in a
+    # browser: Compose substituted it away before we ever saw it. We cannot tell
+    # a truncated password from a genuine one, so say the whole story once.
+    if usms_password and "$" in usms_password and not _env_text("USMS_PASSWORD_FILE"):
+        log.warning("USMS_PASSWORD contains '$' — Docker Compose interpolates that, so a "
+                    "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
+                    "portal rejects it. Escape it as '$$' in the compose file, or put the "
+                    "credential in a file and set USMS_PASSWORD_FILE=/path/to/file.")
 
     if mqtt_broker and mqtt is None:
         problems.append("MQTT_BROKER is set but paho-mqtt is not installed")
@@ -767,12 +827,36 @@ def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT, cycle_id="none", field
 # Value shapes. The dashboard cells are read by absolute XPath, so inserting one
 # table row resolves every offset to the WRONG cell and would publish it happily
 # forever. A shape check turns that silent corruption into a warning.
+#
+# The unit is deliberately not tied to kWh: an account can hold more than one
+# meter (electricity in kWh, water in m³), and refusing anything but kWh threw
+# away every water reading as "not a kWh reading".
 _FIELD_SHAPES = {
-    "unit": (re.compile(r"^\d[\d,]*(?:\.\d+)?\s*kWh$", re.I), "a kWh reading, e.g. 1991.264 kWh"),
+    "unit": (re.compile(r"^\d[\d,]*(?:\.\d+)?\s*(?:kWh|MWh|Wh|m\u00b3|m3|L|litres?|liters?|units?)$", re.I),
+             "a meter reading with a unit, e.g. 1991.264 kWh or 62.320 m\u00b3"),
     "balance": (re.compile(r"^(?:RM|BND|\$)?\s*\d[\d,]*(?:\.\d+)?$", re.I),
                 "an amount, e.g. $67.16"),
     "polled": (re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$"), "a date, e.g. 24/11/2026"),
 }
+
+# Unit suffix -> what kind of meter it is. Used only to name MQTT topics.
+_UNIT_KINDS = (
+    (re.compile(r"kwh$", re.I), "electricity"),
+    (re.compile(r"mwh$", re.I), "electricity"),
+    (re.compile(r"(?:m\u00b3|m3)$", re.I), "water"),
+    (re.compile(r"(?:l|litres?|liters?)$", re.I), "water"),
+)
+
+
+def unit_kind(reading):
+    """'electricity' / 'water' from a validated reading such as '62.320 m³'."""
+    if not reading:
+        return "meter"
+    tail = reading.strip().rsplit(" ", 1)[-1]
+    for pattern, kind in _UNIT_KINDS:
+        if pattern.search(tail):
+            return kind
+    return "meter"
 
 
 def validate_value(field, value, cycle_id="none"):
@@ -789,49 +873,165 @@ def validate_value(field, value, cycle_id="none"):
     return None
 
 
-def _read_dashboard(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
+# --- Meter discovery --------------------------------------------------------
+#
+# The dashboard renders ONE CARD PER METER (a DevExpress ASPxCardView), side by
+# side, each with the same label/value row pairs: Meter No, Full Name, Meter
+# Status, Address, ..., Remaining Unit, Remaining Balance, Last Updated.
+#
+# The old code read three fixed ABSOLUTE XPaths, which can only ever address the
+# FIRST card — so on an account holding both an electricity and a water meter
+# every water reading was invisible, and the water card's "62.320 m³" would have
+# failed the kWh shape check even if it had been read.
+#
+# Locating the label cells BY THEIR TEXT finds every card and stops caring about
+# row indexes, which is what broke whenever the portal inserted a row.
+METER_LABELS = (
+    ("meter_no", "Meter No:"),
+    ("unit", "Remaining Unit:"),
+    ("balance", "Remaining Balance:"),
+    ("polled", "Last Updated:"),
+)
+
+
+def _xpath_literal(text):
+    """Quote text for an XPath expression, whatever quotes it contains."""
+    if "'" not in text:
+        return "'%s'" % text
+    if '"' not in text:
+        return '"%s"' % text
+    parts = ["'%s'" % chunk for chunk in text.split("'")]
+    return "concat(%s)" % ", \"'\", ".join(parts)
+
+
+def _sibling_value(cell):
+    """The value cell that sits next to a label cell, or None."""
+    try:
+        text = (cell.find_element(By.XPATH, "./following-sibling::td[1]").text or "").strip()
+    except WebDriverException:
+        return None
+    return text or None
+
+
+def read_meters(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
+    """Every meter card on the dashboard, in page order, with values validated."""
     started = time.monotonic()
+    columns = {}
+    for field, label in METER_LABELS:
+        # normalize-space(.) not text(): the caption sits in a <span> inside the
+        # cell, so the cell has no direct text node of its own and
+        # normalize-space(text()) matches nothing at all.
+        xpath = "//td[normalize-space(.)=%s]" % _xpath_literal(label)
+        try:
+            columns[field] = driver.find_elements(By.XPATH, xpath)
+        except WebDriverException as e:
+            log.warning("cycle=%s could not enumerate '%s' cells: %s", cycle_id, label, e)
+            columns[field] = []
+
+    count = len(columns["unit"])
+    if count == 0:
+        return []
+
+    meters = []
+    for index in range(count):
+        meter = {}
+        for field, _label in METER_LABELS:
+            cells = columns[field]
+            raw = _sibling_value(cells[index]) if index < len(cells) else None
+            if field == "meter_no":
+                meter["meter_no"] = raw
+            else:
+                meter[field] = validate_value(field, raw, cycle_id)
+        meter["kind"] = unit_kind(meter.get("unit"))
+        meters.append(meter)
+
+    log.debug("cycle=%s %d meter card(s) read in %.1fs: %s", cycle_id, len(meters),
+              time.monotonic() - started,
+              [{k: m.get(k) for k in ("meter_no", "kind", "unit", "balance", "polled")}
+               for m in meters])
+    return meters
+
+
+def _read_dashboard_legacy(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
+    """Fallback read for a page the label probe could not find cards on."""
     values = {}
     for field, xpath in (("unit", XPATH_UNIT), ("balance", XPATH_BALANCE),
                          ("polled", XPATH_POLLED)):
         values[field] = validate_value(
             field, safe_get_text(driver, xpath, timeout, cycle_id, field), cycle_id)
-    log.debug("cycle=%s dashboard read in %.1fs: %s",
-              cycle_id, time.monotonic() - started,
-              {k: v for k, v in values.items()})
-    return values
+    values["meter_no"] = None
+    values["kind"] = unit_kind(values.get("unit"))
+    log.debug("cycle=%s legacy absolute-XPath read: %s", cycle_id, values)
+    return [values]
+
+
+def _missing_fields(meter):
+    return [name for name in ("unit", "balance", "polled") if meter.get(name) is None]
 
 
 def scrape_data(driver, cycle_id="none"):
-    """(unit, balance, polled, run_time) — any unavailable field is None."""
+    """([meter, ...], run_time) — a meter whose field failed carries None there."""
     log.info("cycle=%s scraping dashboard…", cycle_id)
     _navigate(driver, DASHBOARD_URL, "dashboard", cycle_id)
 
-    values = _read_dashboard(driver, cycle_id=cycle_id)
-    missing = [name for name, value in values.items() if value is None]
+    meters = read_meters(driver, cycle_id=cycle_id)
+    if not meters:
+        log.warning("cycle=%s no meter card found by label — falling back to the "
+                    "fixed absolute XPaths.", cycle_id)
+        log_page_source(driver, "No meter card found", cycle_id)
+        meters = _read_dashboard_legacy(driver, cycle_id=cycle_id)
 
-    if missing:
-        log_page_source(driver, f"Incomplete scrape (missing {','.join(missing)})", cycle_id)
-        log.info("cycle=%s retrying the scrape after a refresh — missing: %s",
-                 cycle_id, ", ".join(missing))
+    if any(_missing_fields(meter) for meter in meters):
+        problems = "; ".join(
+            "meter %s missing %s" % (meter.get("meter_no") or "n/a", ",".join(_missing_fields(meter)))
+            for meter in meters if _missing_fields(meter))
+        log_page_source(driver, "Incomplete scrape (%s)" % problems, cycle_id)
+        log.info("cycle=%s retrying the scrape after a refresh — %s", cycle_id, problems)
+
         time.sleep(SCRAPE_RETRY_SLEEP)
         _navigate(driver, DASHBOARD_URL, "dashboard (retry)", cycle_id)
-        for name, value in _read_dashboard(
-                driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id).items():
-            if values[name] is None and value is not None:
-                values[name] = value
-                log.info("cycle=%s %s recovered on the retry: %r", cycle_id, name, value)
-        missing = [name for name, value in values.items() if value is None]
-        if missing:
-            log.warning("cycle=%s still missing after the retry: %s",
-                        cycle_id, ", ".join(missing))
+        retry = read_meters(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
+        if not retry:
+            retry = _read_dashboard_legacy(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
+
+        for index, meter in enumerate(meters):
+            if index >= len(retry):
+                break
+            for field in ("unit", "balance", "polled"):
+                if meter.get(field) is None and retry[index].get(field) is not None:
+                    meter[field] = retry[index][field]
+                    log.info("cycle=%s meter %s %s recovered on the retry: %r",
+                             cycle_id, meter.get("meter_no") or "n/a", field,
+                             retry[index][field])
+            if meter.get("kind") in (None, "meter"):
+                meter["kind"] = unit_kind(meter.get("unit"))
+
+        still = "; ".join(
+            "meter %s still missing %s" % (meter.get("meter_no") or "n/a", ",".join(_missing_fields(meter)))
+            for meter in meters if _missing_fields(meter))
+        if still:
+            log.warning("cycle=%s %s", cycle_id, still)
 
     run_time = now_stamp()
-    log.info("cycle=%s unit=%s | balance=%s | last polled=%s | time=%s",
-             cycle_id,
-             values["unit"] or "N/A", values["balance"] or "N/A",
-             values["polled"] or "N/A", run_time)
-    return values["unit"], values["balance"], values["polled"], run_time
+    for meter in meters:
+        log.info("cycle=%s meter=%s kind=%s unit=%s | balance=%s | last polled=%s | time=%s",
+                 cycle_id, meter.get("meter_no") or "n/a", meter.get("kind"),
+                 meter.get("unit") or "N/A", meter.get("balance") or "N/A",
+                 meter.get("polled") or "N/A", run_time)
+    return meters, run_time
+
+
+def cycle_status(meters):
+    """'ok' only when every meter came back complete."""
+    statuses = [result_status(meter.get("unit"), meter.get("balance"), meter.get("polled"))
+                for meter in meters]
+    if not statuses:
+        return "fail"
+    if all(status == "ok" for status in statuses):
+        return "ok"
+    if all(status == "fail" for status in statuses):
+        return "fail"
+    return "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -871,16 +1071,47 @@ def _publish_topic(client, topic, value, cycle_id):
     return False
 
 
-def publish_mqtt(unit, balance, polled, run_time, cycle_id="none"):
-    """Publish what validated, plus a status topic. True only on a complete cycle.
+def _meter_topic_slugs(meters):
+    """A stable topic segment per meter: the kind, or kind + meter number."""
+    kinds = Counter(meter.get("kind") or "meter" for meter in meters)
+    slugs = []
+    for position, meter in enumerate(meters):
+        kind = meter.get("kind") or "meter"
+        if kinds[kind] > 1:
+            slugs.append("%s_%s" % (kind, re.sub(r"\W+", "", meter.get("meter_no") or str(position))))
+        else:
+            slugs.append(kind)
+    return slugs
 
-    Only fields that actually validated are published: a partial scrape used to
-    overwrite a good HA sensor with the literal string "N/A", which silently
-    breaks that sensor's statistics while the other two keep updating. A skipped
-    publish leaves the last retained value in place, and last_run only advances on
-    a complete cycle so HA can alert on a stale scraper.
+
+def primary_meter_index(meters):
+    """The meter the LEGACY topics follow: the electricity one when there is one."""
+    for index, meter in enumerate(meters):
+        if meter.get("kind") == "electricity":
+            return index
+    return 0
+
+
+def _publish_meter(client, meter, cycle_id, prefix="home/usms"):
+    """Publish one meter's validated fields under `prefix`; returns per-field results."""
+    got = {}
+    for field, suffix in (("unit", "remaining_unit"), ("balance", "remaining_balance"),
+                          ("polled", "meter_last_polled"), ("meter_no", "meter_no")):
+        value = meter.get(field)
+        got[field] = bool(value) and _publish_topic(
+            client, "%s/%s" % (prefix, suffix), value, cycle_id)
+    return got
+
+
+def publish_mqtt(meters, run_time, cycle_id="none"):
+    """Publish what validated. True only when EVERY meter completed cleanly.
+
+    A single-meter account keeps exactly the historical topic set. A multi-meter
+    account additionally gets `home/usms/<kind>/…` per meter, while the legacy
+    topics stay bound to the primary (electricity) meter so an existing Home
+    Assistant setup keeps working untouched.
     """
-    status = result_status(unit, balance, polled)
+    status = cycle_status(meters)
 
     if not mqtt_enabled:
         log.info("cycle=%s mqtt disabled (%s) — status=%s, nothing published",
@@ -909,11 +1140,26 @@ def publish_mqtt(unit, balance, polled, run_time, cycle_id="none"):
                   cycle_id, mqtt_broker, mqtt_port, rc, "offline")
 
         client.loop_start()
-        published["unit"] = _publish_topic(client, topic_unit, unit, cycle_id) if unit else False
-        published["balance"] = (
-            _publish_topic(client, topic_balance, balance, cycle_id) if balance else False)
-        published["polled"] = (
-            _publish_topic(client, topic_polled, polled, cycle_id) if polled else False)
+
+        if len(meters) > 1:
+            for meter, slug in zip(meters, _meter_topic_slugs(meters)):
+                got = _publish_meter(client, meter, cycle_id, prefix="home/usms/%s" % slug)
+                meter_status = result_status(meter.get("unit"), meter.get("balance"),
+                                             meter.get("polled"))
+                got["status"] = _publish_topic(
+                    client, "home/usms/%s/status" % slug, meter_status, cycle_id)
+                for field, ok in got.items():
+                    published["%s.%s" % (slug, field)] = ok
+                log.info("cycle=%s meter=%s (%s) published under home/usms/%s/* status=%s",
+                         cycle_id, meter.get("meter_no") or "n/a", slug, slug, meter_status)
+            primary = meters[primary_meter_index(meters)]
+            log.info("cycle=%s legacy topics follow meter %s",
+                     cycle_id, primary.get("meter_no") or "n/a")
+        else:
+            primary = meters[0]
+
+        for field, ok in _publish_meter(client, primary, cycle_id).items():
+            published[field] = ok
 
         if status == "ok":
             published["last_run"] = _publish_topic(client, topic_lastrun, run_time, cycle_id)
@@ -939,11 +1185,14 @@ def publish_mqtt(unit, balance, polled, run_time, cycle_id="none"):
     return ok
 
 
-def print_summary(unit, balance, polled, run_time):
+def print_summary(meters, run_time):
     print("\n=== USMS Data Summary ===")
-    print(f"Remaining Unit    : {unit or 'N/A'}")
-    print(f"Remaining Balance : {balance or 'N/A'}")
-    print(f"Meter Last Polled : {polled or 'N/A'}")
+    for meter in meters:
+        label = "%s (%s)" % (meter.get("meter_no") or "meter", meter.get("kind") or "unknown")
+        print(f"{label}")
+        print(f"  Remaining Unit    : {meter.get('unit') or 'N/A'}")
+        print(f"  Remaining Balance : {meter.get('balance') or 'N/A'}")
+        print(f"  Meter Last Polled : {meter.get('polled') or 'N/A'}")
     print(f"Last Run Time     : {run_time}")
     print("========================\n")
 
@@ -952,12 +1201,19 @@ def print_summary(unit, balance, polled, run_time):
 # One cycle + the supervisor loop
 # ---------------------------------------------------------------------------
 
-def log_cycle_summary(cycle_id, status, unit, balance, polled, timings, total):
-    """One greppable line that answers: which cycle, how slow, what happened."""
+def log_cycle_summary(cycle_id, status, meters, timings, total):
+    """One greppable line that answers: which cycle, how slow, what happened.
+
+    unit/balance/polled stay in the line for the single-meter case (and tooling
+    that greps them); a multi-meter account shows the primary meter's readings
+    here and every meter's own line above.
+    """
+    primary = meters[primary_meter_index(meters)] if meters else {}
     log.info(
-        "cycle=%s result=%s unit=%r balance=%r polled=%r captcha_rolls=%d "
+        "cycle=%s result=%s meters=%d unit=%r balance=%r polled=%r captcha_rolls=%d "
         "driver=%.1fs login=%.1fs scrape=%.1fs publish=%.1fs total=%.1fs",
-        cycle_id, status, unit, balance, polled, _cycle_state["captcha_rolls"],
+        cycle_id, status, len(meters), primary.get("unit"), primary.get("balance"),
+        primary.get("polled"), _cycle_state["captcha_rolls"],
         timings.get("driver", 0.0), timings.get("login", 0.0),
         timings.get("scrape", 0.0), timings.get("publish", 0.0), total,
     )
@@ -970,7 +1226,7 @@ def run_cycle(cycle_id="none"):
     timings = {}
     status = "fail"
     published = False
-    unit = balance = polled = None
+    meters = []
     _cycle_state["captcha_rolls"] = 0
     log.info("cycle=%s begin (interval=%ds, selenium=%s:%s, mqtt=%s)",
              cycle_id, scrape_interval, selenium_host, selenium_port,
@@ -988,14 +1244,14 @@ def run_cycle(cycle_id="none"):
         timings["login"] = time.monotonic() - mark
 
         mark = time.monotonic()
-        unit, balance, polled, run_time = scrape_data(driver, cycle_id)
+        meters, run_time = scrape_data(driver, cycle_id)
         timings["scrape"] = time.monotonic() - mark
-        status = result_status(unit, balance, polled)
+        status = cycle_status(meters)
 
         mark = time.monotonic()
-        published = publish_mqtt(unit, balance, polled, run_time, cycle_id)
+        published = publish_mqtt(meters, run_time, cycle_id)
         timings["publish"] = time.monotonic() - mark
-        print_summary(unit, balance, polled, run_time)
+        print_summary(meters, run_time)
     finally:
         if driver is not None:
             try:
@@ -1003,7 +1259,7 @@ def run_cycle(cycle_id="none"):
                 log.debug("cycle=%s WebDriver session cleaned up.", cycle_id)
             except Exception as e:
                 log.warning("cycle=%s WebDriver cleanup warning (non-fatal): %s", cycle_id, e)
-        log_cycle_summary(cycle_id, status, unit, balance, polled, timings,
+        log_cycle_summary(cycle_id, status, meters, timings,
                           time.monotonic() - started)
 
     return {"status": status, "published": published}

@@ -19,7 +19,9 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - **Captcha login**: The site's second login stage asks for a captcha. It is read locally by `ddddocr` and only submitted when 4 of 5 OCR passes agree; a disagreement just re-rolls a fresh code, which costs nothing
 - **Smart failure handling**: Publishes only the fields that validated — a partial scrape never overwrites a good Home Assistant sensor with the text `N/A`. Skipped publishes keep the last retained value, and `home/usms/last_run` only advances on a fully successful cycle, so Home Assistant can alert on a *stale* scraper instead of a dead one
 - **Auto-heal**: Any 3 consecutive failed cycles (portal, captcha, Selenium — not just `N/A` results) exit the container so Docker's `restart: unless-stopped` recycles it cleanly
-- **Value checks**: Every field is shape-checked (`… kWh`, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
+- **Value checks**: Every field is shape-checked (a reading with its unit — `… kWh` or `… m³` —, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
+- **Multi-meter accounts**: Every meter card on the dashboard is read — electricity, water or both — each published under its own `home/usms/<type>/…` topics, with the classic topics following the electricity meter so existing dashboards keep working
+- **Credential handling**: `USMS_PASSWORD_FILE` / `USMS_USERNAME_FILE` for passwords Docker Compose would mangle (it interpolates `$` away and passes quotes through literally), plus startup warnings that name the problem instead of failing the login
 - **Retained + QoS 1**: Publishes are retained, so a Home Assistant restart recovers the last values instantly; `home/usms/status` (`ok` / `partial` / `fail`, plus an `offline` last-will) reports scraper health
 - **Debug friendly**: Logs page title, URL and a digit-masked body preview on failure, saves the full page to `/tmp` for layout work, and ends every cycle with one greppable line —
   `cycle=dc74 result=ok unit='1987.599 kWh' balance='$67.12' polled='24/11/2026' captcha_rolls=1 driver=0.2s login=12.9s scrape=0.1s publish=1.0s total=14.2s`.
@@ -35,6 +37,8 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
 | `USMS_USERNAME`  | Your USMS Smart Meter account username (Brunei IC number)                                       | Yes      | N/A           |
 | `USMS_PASSWORD`  | Your USMS Smart Meter account password                                                         | Yes      | N/A           |
+| `USMS_USERNAME_FILE` | Path to a file containing the username (Docker secret / bind mount). Used when `USMS_USERNAME` is unset. | No | N/A |
+| `USMS_PASSWORD_FILE` | Path to a file containing the password (Docker secret / bind mount). Used when `USMS_PASSWORD` is unset. | No | N/A |
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `localhost`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address (MQTT is enabled only when this is set)                      | No       | N/A           |
@@ -48,6 +52,38 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 `LOG_LEVEL=DEBUG` deliberately does **not** raise the Selenium/urllib3 loggers: their
 per-request debug records contain the account password and IC number.
 
+### Passwords containing `$`, quotes or spaces
+
+Docker Compose interpolates `$` in **every** value it reads — `environment:`,
+`env_file:` and `.env` alike. A password like `MyP@ss$w0rd` therefore reaches the
+container as `MyP@ss` (`$w0rd` is substituted as an empty variable), which the portal
+answers with the same "Incorrect user name and password" it gives a genuinely wrong
+password. Three ways to get it right, in order of preference:
+
+1. **A file instead of an environment value** — nothing is interpolated in front of it:
+   ```yaml
+   environment:
+     - USMS_USERNAME=01234567
+     - USMS_PASSWORD_FILE=/run/secrets/usms_pw
+   volumes:
+     - ./usms_pw:/run/secrets/usms_pw:ro
+   ```
+   (or the same path from a Docker `secrets:` entry). The scraper logs
+   `USMS_PASSWORD loaded from … (N characters)` at startup.
+2. **Double every `$`** in the compose file — the same example written as
+   `MyP@ss$$w0rd` reaches the container correctly:
+   ```yaml
+   environment:
+     - USMS_PASSWORD=MyP@ss$$w0rd
+   ```
+3. A password without `$` in it.
+
+Quotes are a second trap: in the `- KEY=value` list form the quotes are **literal**
+characters, so `- USMS_PASSWORD="MyP@ss$w0rd"` sends the quote characters too. The
+scraper now strips one matching pair of surrounding quotes and logs a warning, and
+leading/trailing spaces are stripped too. If a password contains `$` and no
+`USMS_PASSWORD_FILE` is set, startup logs a warning explaining the truncation.
+
 ---
 
 
@@ -56,8 +92,24 @@ per-request debug records contain the account password and IC number.
 - `home/usms/remaining_unit` — Remaining units on your smart meter  
 - `home/usms/remaining_balance` — Remaining balance in your account  
 - `home/usms/meter_last_polled` — Last meter polling timestamp  
+- `home/usms/meter_no` — Meter number of the meter the topics above describe  
 - `home/usms/last_run` — Timestamp of the last **fully successful** scrape cycle  
 - `home/usms/status` — `ok` (all three fields), `partial` (some), `fail` (none), `offline` (last will)
+
+### Accounts with more than one meter
+
+A USMS account can hold several meters — typically electricity (`kWh`) and water
+(`m³`). Every meter card on the dashboard is read, and when there is more than
+one each gets its own topic branch named after the meter type:
+
+- `home/usms/electricity/{remaining_unit,remaining_balance,meter_last_polled,meter_no,status}`
+- `home/usms/water/{remaining_unit,remaining_balance,meter_last_polled,meter_no,status}`
+
+The unmetered `home/usms/…` topics stay bound to the **electricity** meter (or the
+first card if there is no electricity meter), so an existing Home Assistant setup
+keeps working without changes. Two meters of the same type get the meter number
+appended instead — `home/usms/electricity_55000001/…`. `status` at the top level is
+`ok` only when every meter came back complete.
 
 All topics are published with `retain=True, qos=1`, so a subscriber that starts late still
 receives the last values. A field that fails validation is simply not published — the
