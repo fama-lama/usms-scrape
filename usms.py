@@ -86,11 +86,81 @@ CAPTCHA_MAX_ROLLS = 10     # re-roll budget per login attempt
 CAPTCHA_CODE_LENGTH = 5
 _captcha_engines = None
 
+# ---------------------------------------------------------------------------
+# ONNX Runtime thread affinity
+#
+# ddddocr runs ONNX Runtime (ORT) sessions under the hood. Unless an explicit
+# thread count is supplied, ORT pins each worker thread with sched_setaffinity()
+# using CPU ids taken from the HOST topology. Inside anything with a restricted
+# or scattered cpuset — an LXC coreset, `docker --cpuset-cpus`, a Kubernetes
+# cpuset, WSL2 — those ids are not permitted, the syscall fails with EINVAL and
+# ORT prints one "pthread_setaffinity_np failed … error code: 22" line per
+# thread on every session creation. Supplying the thread counts is ORT's own
+# documented remedy: it then skips affinity entirely.
+#
+# The numbers are chosen to be safe on any machine: the job is a ~6 ms
+# inference on a 200x80 captcha, so more than a handful of threads buys nothing,
+# and the count respects the cpuset we are actually allowed to run on.
+# ---------------------------------------------------------------------------
+
+ORT_MAX_THREADS = 4
+
+
+def _available_cpus():
+    """CPUs this process may run on — cgroup/cpuset/taskset aware."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))   # Linux
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)            # macOS / Windows fallback
+
+
+def _harden_onnxruntime():
+    """Give ORT explicit thread counts so it never sets CPU affinity.
+
+    Idempotent and best-effort: if ONNX Runtime is missing or a future version
+    changes this API, the captcha reader still works exactly as before — the
+    only loss is the stderr noise this exists to remove.
+    """
+    try:
+        import onnxruntime as ort
+    except Exception:
+        return
+
+    if getattr(ort, "_usms_affinity_hardened", False):
+        return
+
+    workers = max(1, min(ORT_MAX_THREADS, _available_cpus()))
+    original_session = ort.InferenceSession
+
+    def _apply(options):
+        try:
+            options.intra_op_num_threads = workers
+            options.inter_op_num_threads = 1
+        except Exception:
+            pass
+        return options
+
+    def hardened_session(*args, **kwargs):
+        options = kwargs.get("sess_options")
+        if options is None and len(args) > 1 and isinstance(args[1], ort.SessionOptions):
+            options = args[1]
+        options = _apply(options if options is not None else ort.SessionOptions())
+        if len(args) > 1:
+            args = (args[0], options) + args[2:]   # replace the positional slot
+        else:
+            kwargs["sess_options"] = options
+        return original_session(*args, **kwargs)
+
+    ort.InferenceSession = hardened_session  # type: ignore[assignment]
+    setattr(ort, "_usms_affinity_hardened", True)
+    log.debug("ONNX Runtime: %d intra-op / 1 inter-op thread, CPU affinity off.", workers)
+
 
 def _engines():
     """Load ddddocr lazily so a model problem can never stop the container booting."""
     global _captcha_engines
     if _captcha_engines is None:
+        _harden_onnxruntime()
         _captcha_engines = (
             ddddocr.DdddOcr(show_ad=False),
             ddddocr.DdddOcr(show_ad=False, beta=True),

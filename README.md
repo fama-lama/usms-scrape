@@ -21,6 +21,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - **Auto-heal**: After 3 consecutive scrape failures, the container exits so Docker's `restart: unless-stopped` recycles it cleanly
 - **Debug friendly**: Logs page title, URL, and body text on scrape failure so you can see exactly what the USMS site returned
 - **Fresh session per cycle**: Creates clean Chrome options and cleans up WebDriver connections every cycle to prevent long-running connection leaks
+- **Quiet logs on any host**: ONNX Runtime's CPU thread affinity is disabled with explicit thread counts, so containers with a restricted or scattered CPU set (LXC coresets, `--cpuset-cpus`, Kubernetes, WSL2) no longer print `pthread_setaffinity_np failed … error code: 22` on every start
 
 ---
 
