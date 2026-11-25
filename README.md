@@ -1,9 +1,11 @@
-## USMS Scraper BRUNEI
-<img width="64" height="64" alt="usms" src="https://github.com/user-attachments/assets/e4e2fae5-b3ea-4b08-8b51-c8b1a5f4fdbf" /> 
+# USMS Scraper BRUNEI
+
+![version](https://img.shields.io/badge/image-famalama%2Fusms--scrape-blue)
+![license](https://img.shields.io/badge/license-GPLv3-green)
 
 This project scrapes your USMS Smart Meter dashboard data using Selenium WebDriver and optionally publishes updates to an MQTT broker. It runs continuously at configurable intervals.
 
-Only works for smart meters registered with https://www.usms.com.bn/smartmeter/index.html
+Only works for smart meters registered with <https://www.usms.com.bn/>
 
 
 ---
