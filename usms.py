@@ -135,10 +135,19 @@ def _env_secret(name, default=None):
     `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch.
     """
     value = _env_text(name)
+    path = _env_text(name + "_FILE")
+
+    # Both routes set is the trap this whole mechanism exists to prevent: the
+    # environment value WINS, so a `$`-containing password left in compose keeps
+    # overriding the good one in the file and the login keeps failing.
+    if value and path:
+        log.warning("both %s and %s_FILE are set — the environment value WINS and the "
+                    "file is IGNORED. Delete the %s line from the environment (compose) "
+                    "if the file is the one that is correct.", name, name, name)
+
     if value is not None:
         return value
 
-    path = _env_text(name + "_FILE")
     if not path:
         return default
 
@@ -1271,22 +1280,25 @@ def publish_mqtt(meters, run_time, cycle_id="none"):
             expected = len(meters) * len(_DISCOVERY_FIELDS)
             published["discovery"] = discovery_published == expected
 
+        # Every meter always gets its own branch, even when the account has only
+        # one: a topic that appears only sometimes is a documentation trap ("why is
+        # home/usms/electricity empty?"). The legacy home/usms/* topics remain as an
+        # alias for the primary meter so existing sensors keep working.
+        for meter, slug in zip(meters, _meter_topic_slugs(meters)):
+            got = _publish_meter(client, meter, cycle_id, prefix="home/usms/%s" % slug)
+            meter_status = result_status(meter.get("unit"), meter.get("balance"),
+                                         meter.get("polled"))
+            got["status"] = _publish_topic(
+                client, "home/usms/%s/status" % slug, meter_status, cycle_id)
+            for field, ok in got.items():
+                published["%s.%s" % (slug, field)] = ok
+            log.info("cycle=%s meter=%s (%s) published under home/usms/%s/* status=%s",
+                     cycle_id, meter.get("meter_no") or "n/a", slug, slug, meter_status)
+
+        primary = meters[primary_meter_index(meters)]
         if len(meters) > 1:
-            for meter, slug in zip(meters, _meter_topic_slugs(meters)):
-                got = _publish_meter(client, meter, cycle_id, prefix="home/usms/%s" % slug)
-                meter_status = result_status(meter.get("unit"), meter.get("balance"),
-                                             meter.get("polled"))
-                got["status"] = _publish_topic(
-                    client, "home/usms/%s/status" % slug, meter_status, cycle_id)
-                for field, ok in got.items():
-                    published["%s.%s" % (slug, field)] = ok
-                log.info("cycle=%s meter=%s (%s) published under home/usms/%s/* status=%s",
-                         cycle_id, meter.get("meter_no") or "n/a", slug, slug, meter_status)
-            primary = meters[primary_meter_index(meters)]
             log.info("cycle=%s legacy topics follow meter %s",
                      cycle_id, primary.get("meter_no") or "n/a")
-        else:
-            primary = meters[0]
 
         for field, ok in _publish_meter(client, primary, cycle_id).items():
             published[field] = ok

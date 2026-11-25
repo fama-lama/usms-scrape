@@ -1,71 +1,107 @@
 #!/usr/bin/env bash
-# Create the credentials file the scraper reads at /run/secrets/usms_pw.
+# Create the credentials file(s) the scraper reads at run time.
 #
-#   ./make-credentials.sh [path]        (default: ./usms_pw)
+#   ./make-credentials.sh                       # ./usms_pw   (password only — the usual case)
+#   ./make-credentials.sh my-password.txt        # choose the filename
+#   ./make-credentials.sh usms_pw --with-username
+#                                                # also writes ./usms_user (IC number)
 #
-# Why a file at all: Docker Compose INTERPOLATES `$` in every value it reads
-# (environment:, env_file:, .env), so a password like `$ecret1` or `MyP@ss$w0rd`
-# is truncated or emptied before the container ever starts. A file the scraper
-# opens itself is never touched by Compose, so `$`, quotes, spaces and
+# WHY A FILE AT ALL — Docker Compose INTERPOLATES `$` in every value it reads
+# (environment:, env_file:, .env). A password like `$ecret1` arrives EMPTY and
+# `MyP@ss$w0rd` arrives as `MyP@ss` — before the container ever starts. A file the
+# scraper opens itself is never touched by Compose, so `$`, quotes, spaces and
 # backslashes all survive.
 #
-# The file this writes carries a comment header; the scraper ignores lines that
-# start with `#` and blank lines, and uses the first other line. Until you
-# replace the PASTE-YOUR-PASSWORD-HERE line the container refuses to start and
-# says exactly that, so a half-finished setup can never look like a wrong
-# password.
+# USE ONE ROUTE OR THE OTHER, NOT BOTH. If `USMS_PASSWORD` is also set in compose
+# it WINS over `USMS_PASSWORD_FILE` and the file is ignored — the scraper warns
+# when it sees both, but the real fix is to delete the environment line.
+#
+# The username (IC number) is digits only, so it normally lives happily in
+# compose; --with-username exists for people who want nothing in the compose file.
 set -euo pipefail
 
-target="${1:-usms_pw}"
+target="usms_pw"
+want_username=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-username) want_username=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) target="$arg" ;;
+  esac
+done
 
-if [ -d "$target" ]; then
-  echo "ERROR: $target is a DIRECTORY, not a file." >&2
-  echo "       Docker creates an empty directory at a bind-mount path whose host file" >&2
-  echo "       does not exist — that is also why the scraper says the path is a directory." >&2
-  echo "       Remove it (rmdir '$target') and run this script again." >&2
-  exit 1
+write_template() {
+  local path="$1" kind="$2" placeholder="$3" note="$4" var="$5"
+  local base
+  base="$(basename "$path")"
+
+  if [ -d "$path" ]; then
+    echo "ERROR: $path is a DIRECTORY, not a file." >&2
+    echo "       Docker creates an empty directory at a bind-mount path whose host file" >&2
+    echo "       does not exist — that is also why the scraper calls the path a directory." >&2
+    echo "       Remove it (rmdir '$path') and run this script again." >&2
+    exit 1
+  fi
+  if [ -e "$path" ]; then
+    echo "REFUSING to overwrite the existing $path — it may already hold a real value." >&2
+    echo "Delete it yourself if you really want a fresh template." >&2
+    exit 1
+  fi
+
+  umask 077
+  {
+    echo '# ─────────────────────────────────────────────────────────────────────────────'
+    echo "# USMS $kind — read by the container, never parsed by Docker Compose."
+    echo '#'
+    echo "# Replace the $placeholder line below with the real value and save."
+    echo '# Keep it a single line. Everything is safe in here: $, quotes, spaces,'
+    echo '# backslashes — Compose cannot mangle a file it never reads.'
+    echo '#'
+    echo '# Lines beginning with # and blank lines are ignored; the first other'
+    echo '# line is the value.'
+    echo '#'
+    [ -n "$note" ] && printf '%s' "$note"
+    echo '#'
+    echo '# Wire it up in compose.yaml — and DELETE the matching environment'
+    echo "# variable ($var), because that one wins and would override this file:"
+    echo '#'
+    echo '#   services:'
+    echo '#     usms-scrape:'
+    echo '#       environment:'
+    echo "#         - ${var}_FILE=/run/secrets/$base"
+    echo '#       volumes:'
+    echo "#         - ./$base:/run/secrets/$base:ro"
+    echo '#'
+    echo '# Startup then logs the length only, never the value:'
+    echo "#   $var loaded from /run/secrets/$base (11 characters)"
+    echo '#'
+    echo '# If that length is shorter than what you typed, something truncated it.'
+    echo '# ─────────────────────────────────────────────────────────────────────────────'
+    echo "$placeholder"
+  } > "$path"
+  chmod 600 "$path"
+  echo "created $path (mode 600, owner-only) for $var"
+}
+
+write_template "$target" "password" "PASTE-YOUR-PASSWORD-HERE" "" "USMS_PASSWORD"
+
+if [ "$want_username" -eq 1 ]; then
+  user_path="usms_user"
+  if [ "$(dirname "$target")" != "." ]; then
+    user_path="$(dirname "$target")/usms_user"
+  fi
+  write_template "$user_path" "username (IC number)" "PASTE-YOUR-IC-NUMBER-HERE" \
+'# The IC number is digits only, so it normally lives in compose quite happily.
+# Use this file only if you want nothing at all in the compose environment.
+' "USMS_USERNAME"
 fi
 
-if [ -e "$target" ]; then
-  echo "REFUSING to overwrite the existing $target — it may already hold the password." >&2
-  echo "Delete it yourself if you really want a fresh template." >&2
-  exit 1
-fi
-
-umask 077
-cat > "$target" <<'TEMPLATE'
-# ─────────────────────────────────────────────────────────────────────────────
-# USMS scraper password  —  read by the container, never parsed by Compose.
-#
-# Replace the PASTE-YOUR-PASSWORD-HERE line below with the real password and
-# save. Keep it a single line. Everything is safe in here: $, quotes, spaces,
-# backslashes — Compose cannot mangle a file it never reads.
-#
-# Lines beginning with # and blank lines are ignored; the first other line is
-# the password. A password whose own first character is # will be read as a
-# comment — put that one in the environment with a $$ escape instead.
-#
-# Wire it up in compose.yaml:
-#
-#   services:
-#     usms-scrape:
-#       environment:
-#         - USMS_USERNAME=01234567
-#         - USMS_PASSWORD_FILE=/run/secrets/usms_pw
-#       volumes:
-#         - ./usms_pw:/run/secrets/usms_pw:ro
-#
-# The startup log then prints, with the length only, never the value:
-#
-#   USMS_PASSWORD loaded from /run/secrets/usms_pw (11 characters)
-#   config: ... credentials username=set password=set (11 chars) ...
-#
-# If that length is shorter than the password you typed, something truncated it.
-# ─────────────────────────────────────────────────────────────────────────────
-PASTE-YOUR-PASSWORD-HERE
-TEMPLATE
-
-chmod 600 "$target"
-echo "created $target (mode 600, owner-only)."
-echo "Now edit it and replace the PASTE-YOUR-PASSWORD-HERE line, then:"
+echo
+echo "NEXT: edit the file(s), replace the placeholder, then"
 echo "  docker compose up -d --force-recreate usms-scrape"
+echo
+echo "REMEMBER: one route only. If the same value is also in compose as an"
+echo "environment variable, that wins and the file is ignored."

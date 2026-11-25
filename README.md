@@ -37,10 +37,10 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 
 | Variable         | Description                                                                                     | Required | Default       |
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
-| `USMS_USERNAME`  | Your USMS Smart Meter account username (Brunei IC number)                                       | Yes      | N/A           |
-| `USMS_PASSWORD`  | Your USMS Smart Meter account password                                                         | Yes      | N/A           |
-| `USMS_USERNAME_FILE` | Path to a file containing the username (Docker secret / bind mount). Used when `USMS_USERNAME` is unset. | No | N/A |
-| `USMS_PASSWORD_FILE` | Path to a file containing the password (Docker secret / bind mount). Used when `USMS_PASSWORD` is unset. | No | N/A |
+| `USMS_USERNAME`  | Account username (Brunei IC number) — **route A** of "Credentials: pick ONE route" | route A | N/A |
+| `USMS_PASSWORD`  | Account password — **route A**; breaks if the password contains `$`                | route A | N/A |
+| `USMS_USERNAME_FILE` | Path to a file holding the username — **route B**; only needed if you want nothing at all in compose | route B | N/A |
+| `USMS_PASSWORD_FILE` | Path to a file holding the password — **route B**; the route that survives `$`, quotes and spaces | route B | N/A |
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `localhost`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address (MQTT is enabled only when this is set)                      | No       | N/A           |
@@ -54,54 +54,94 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 `LOG_LEVEL=DEBUG` deliberately does **not** raise the Selenium/urllib3 loggers: their
 per-request debug records contain the account password and IC number.
 
-### Passwords containing `$`, quotes or spaces
+### Credentials: pick ONE route
 
-Docker Compose interpolates `$` in **every** value it reads — `environment:`,
-`env_file:` and `.env` alike. A password like `MyP@ss$w0rd` therefore reaches the
-container as `MyP@ss` (`$w0rd` is substituted as an empty variable), which the portal
-answers with the same "Incorrect user name and password" it gives a genuinely wrong
-password. Three ways to get it right, in order of preference:
+There are two ways to give the scraper the account username and password, and
+**you use one or the other — not both.** Both routes work; route A is simpler and
+route B is the one that cannot be broken by special characters.
 
-1. **A file instead of an environment value** — nothing is interpolated in front of it.
-   Generate the file first, then edit one line in it:
-   ```bash
-   ./make-credentials.sh            # writes ./usms_pw, mode 600, with instructions inside
-   $EDITOR usms_pw                  # replace the PASTE-YOUR-PASSWORD-HERE line
-   ```
-   ```yaml
-   environment:
-     - USMS_USERNAME=01234567
-     - USMS_PASSWORD_FILE=/run/secrets/usms_pw   # absolute path INSIDE the container
-   volumes:
-     - ./usms_pw:/run/secrets/usms_pw:ro
-   ```
-   The generated file carries a comment header; the scraper ignores `#` lines and
-   blanks and uses the first other line, so the instructions can stay in the file
-   beside the password. Until the placeholder is replaced the container refuses to
-   start and says so — a half-finished setup can never masquerade as a wrong
-   password. Startup then logs `USMS_PASSWORD loaded from … (N characters)` and the
-   config line shows `password=set (N chars)`; if N is shorter than what you typed,
-   something truncated it.
+#### Route A — in the compose file
 
-   Create the file **before** the first `up`: a bind-mount whose host path does not
-   exist becomes an empty *directory*, and the scraper now names that case
-   explicitly. The same path also works as a Docker `secrets:` target.
-2. **Double every `$`** in the compose file — the same example written as
-   `MyP@ss$$w0rd` reaches the container correctly:
-   ```yaml
-   environment:
-     - USMS_PASSWORD=MyP@ss$$w0rd
-   ```
-3. A password without `$` in it.
+```yaml
+environment:
+  - USMS_USERNAME=01234567
+  - USMS_PASSWORD=PASSWORD123!
+```
 
-Quotes are a second trap: in the `- KEY=value` list form the quotes are **literal**
-characters, so `- USMS_PASSWORD="MyP@ss$w0rd"` sends the quote characters too. The
-scraper now strips one matching pair of surrounding quotes and logs a warning, and
-leading/trailing spaces are stripped too. If a password contains `$` and no
-`USMS_PASSWORD_FILE` is set, startup logs a warning explaining the truncation.
+Simple, and perfectly safe **as long as the password contains no `$`**. Docker
+Compose interpolates `$` in every value it reads — `environment:`, `env_file:` and
+`.env` all alike:
+
+| password | what the container receives |
+|---|---|
+| `PASSWORD123!` | `PASSWORD123!` ✓ |
+| `MyP@ss$w0rd` | `MyP@ss` ✗ (the `$w0rd` is replaced by an empty variable) |
+| `$ecret123` | *(nothing at all)* ✗ |
+
+A truncated password reaches the portal, which answers **"Incorrect user name and
+password"** — the same message as a genuinely wrong password, which is why this cost
+a real account days. A password that starts with `$` arrives empty and the container
+refuses to start instead.
+
+#### Route B — a file the scraper reads
+
+Nothing is interpolated in front of a file, so `$`, quotes, spaces and backslashes
+all survive.
+
+```bash
+./make-credentials.sh            # writes ./usms_pw (mode 600) with instructions inside
+$EDITOR usms_pw                  # replace the PASTE-YOUR-PASSWORD-HERE line
+```
+
+```yaml
+services:
+  usms-scrape:
+    environment:
+      - USMS_USERNAME=01234567                  # digits only, happy in compose
+      # (delete any USMS_PASSWORD=... line that is still here)
+      - USMS_PASSWORD_FILE=/run/secrets/usms_pw
+    volumes:
+      - ./usms_pw:/run/secrets/usms_pw:ro
+```
+
+**Remove the `USMS_PASSWORD` line.** If both are set, the environment variable
+**wins** and the file is ignored — so leaving a `$`-containing password in compose
+keeps overriding the good one in the file, and the login keeps failing. The scraper
+does log a warning when it sees both, but deleting the line is the fix:
+
+```
+both USMS_PASSWORD and USMS_PASSWORD_FILE are set — the environment value WINS
+and the file is IGNORED.
+```
+
+Create the file **before** the first `up`: a bind-mount whose host path does not
+exist yet becomes an empty *directory*, and the scraper names that case explicitly
+rather than reporting a generic read error.
+
+#### Why are there two `*_FILE` variables?
+
+Because they are two independent settings, and most people need only one:
+
+- `USMS_PASSWORD_FILE` — the useful one. Passwords contain `$`, `!`, quotes.
+- `USMS_USERNAME_FILE` — for the IC number, which is digits only and therefore
+  normally lives happily in compose. It exists so you *can* keep everything out of
+  the compose file if you prefer; `make-credentials.sh --with-username` writes it.
+
+#### Which route do I need?
+
+| Password contains | Route A | Route B |
+|---|---|---|
+| no `$` | works | works |
+| `$` in the middle | truncated → login rejected | works |
+| starts with `$` | emptied → refuses to start | works |
+| quotes (`"` / `'`) | stripped, with a warning | works, kept as typed |
+| spaces | stripped | works, kept as typed |
+
+Route B is also what makes the password length visible in the log
+(`USMS_PASSWORD loaded from … (11 characters)`), which is the quickest way to prove
+nothing was mangled.
 
 ---
-
 
 ## MQTT Topics Published
 
@@ -112,26 +152,30 @@ leading/trailing spaces are stripped too. If a password contains `$` and no
 - `home/usms/last_run` — Timestamp of the last **fully successful** scrape cycle  
 - `home/usms/status` — `ok` (every field of every meter), `partial` (some), `fail` (none), `offline` (last will)
 
-### Accounts with more than one meter
+### Per-meter topics — published for EVERY account
 
-A USMS account can hold several meters — typically electricity (`kWh`) and water
-(`m³`). Every meter card on the dashboard is read, and when there is more than
-one each gets its own topic branch named after the meter type:
+Every meter card on the dashboard is read, and every meter always gets its own
+topic branch named after its type:
 
 - `home/usms/electricity/{remaining_unit,remaining_balance,meter_last_polled,meter_no,status}`
 - `home/usms/water/{remaining_unit,remaining_balance,meter_last_polled,meter_no,status}`
 
-The unmetered `home/usms/…` topics stay bound to the **electricity** meter (or the
-first card if there is no electricity meter), so an existing Home Assistant setup
-keeps working without changes. Two meters of the same type get the meter number
-appended instead — `home/usms/electricity_55000001/…`. `status` at the top level is
-`ok` only when every meter came back complete.
+This happens whether the account holds one meter or three — a branch that appeared
+only for some accounts would be a trap.
+
+The **legacy** `home/usms/*` topics are an alias for ONE meter: the electricity one,
+or the first card when there is no electricity meter. That is what existing
+dashboards and the sensor YAML below use, so nothing breaks on upgrade.
+
+Two meters of the same type get the meter number appended instead —
+`home/usms/electricity_55000001/…`. Top-level `status` is `ok` only when **every**
+meter came back complete.
 
 ### Home Assistant entities (MQTT discovery)
 
-For any account that needs the new branches — more than one meter, or a single
-meter that is not electricity — the scraper publishes retained **MQTT discovery**
-configs, so Home Assistant creates the entities itself and no YAML is needed:
+For every account **except the single-electricity-meter case**, the scraper
+publishes retained **MQTT discovery** configs, so Home Assistant creates the entities
+itself and no YAML is needed:
 
 - per meter: `sensor.usms_<meter>_remaining_unit`, `_remaining_balance`,
   `_meter_last_polled`, plus diagnostic `_meter_no` and `_status`
@@ -139,10 +183,12 @@ configs, so Home Assistant creates the entities itself and no YAML is needed:
   share a type
 - all sit under one HA device per meter, prefixed `USMS`
 
-Discovery is deliberately **not** published for a single electricity meter: those
-installations already have hand-written sensors on the legacy topics, and discovery
-would add a duplicate set next to them. Requires `MQTT_BROKER` (discovery travels on
-the same connection) and HA's MQTT integration.
+Discovery is deliberately **not** published for a single electricity meter: that is
+the case where hand-written sensors on the legacy topics usually already exist, and
+discovery would add a duplicate set next to them. Everything else — a water meter, a
+gas meter, or any account with two or more meters — gets the entities automatically.
+Requires `MQTT_BROKER` (discovery travels on the same connection) and HA's MQTT
+integration.
 
 All topics are published with `retain=True, qos=1`, so a subscriber that starts late still
 receives the last values. A field that fails validation is simply not published — the
@@ -325,22 +371,39 @@ masked, the names are not).
 
 ## Home Assistant sensors
 
-Two ways to get entities, pick one:
+There are two ways to get entities into Home Assistant. **Check the first one before
+writing any YAML** — for a water, gas or multi-meter account it has probably already
+created what you need.
 
-- **MQTT discovery (nothing to write)** — for a multi-meter, water-only or gas
-  account the scraper publishes discovery configs and HA builds the sensors itself
-  on the first cycle (see "Home Assistant entities (MQTT discovery)" above). If you
-  see `sensor.usms_water_remaining_unit`, this is already working and you can skip
-  the YAML below.
-- **`configuration.yaml` (below)** — the classic route, bound to the legacy
-  `home/usms/*` topics, which follow the **electricity** meter.
+### 1. MQTT discovery (automatic, no YAML)
 
-> **A water reading does not fit this YAML.** `unit_of_measurement: kWh` and the
-> balance's `BND` are electricity assumptions. For a water meter either let
-> discovery create the entities, or copy these four sensors onto the
-> `home/usms/water/…` topics with `unit_of_measurement: m³`.
+On the first cycle the scraper publishes retained discovery configs and HA builds
+the entities itself. Look for these under **Settings → Devices & Services → MQTT**:
 
-Insert this into your `configuration.yaml`:
+| Meter type | Entities created |
+|---|---|
+| water | `sensor.usms_water_remaining_unit`, `sensor.usms_water_remaining_balance`, `sensor.usms_water_meter_last_polled`, `sensor.usms_water_meter_no` *(diagnostic)*, `sensor.usms_water_status` *(diagnostic)* |
+| electricity (multi-meter accounts) | the same five with `usms_electricity_…` |
+| two meters of one type | `usms_electricity_<meter_no>_…` |
+
+Each meter becomes its own HA device (`USMS Water meter`, `USMS Electricity meter`)
+with the meter number as its serial number.
+
+Discovery is deliberately **skipped for a single electricity meter**, because that is
+the case where hand-written YAML sensors (below) usually already exist and discovery
+would create a duplicate set beside them. Everything else gets it automatically —
+including a water-only account and any account with more than one meter.
+
+Requires `MQTT_BROKER` (discovery rides the same connection) and HA's MQTT
+integration. If the entities do not appear, check the log line
+`published N discovery config(s) for M meter(s)`.
+
+### 2. YAML sensors
+
+Pick the block that matches your account.
+
+**Electricity — the legacy topics** (these exist for every account; they follow the
+electricity meter). This is the historical block, unchanged:
 
 ```yaml
 mqtt:
@@ -364,12 +427,47 @@ mqtt:
       state_topic: home/usms/meter_last_polled
       value_template: "{{ value }}"
 
-
     # When the scraper last succeeded — stays put when a run fails, so a gap here means the scraper is stuck
     - name: USMS Last Run Time
       state_topic: home/usms/last_run
       value_template: "{{ value | as_datetime('%Y-%m-%d %H:%M:%S') }}"
 ```
+
+**Water — the per-meter topics.** Same shape, different topic branch and unit:
+
+```yaml
+mqtt:
+  sensor:
+    # "62.320 m³" -> 62.320
+    - name: USMS Water Remaining Unit
+      state_topic: home/usms/water/remaining_unit
+      value_template: "{{ value.split(' ')[0] }}"
+      unit_of_measurement: "m³"
+      state_class: total
+
+    - name: USMS Water Remaining Balance
+      state_topic: home/usms/water/remaining_balance
+      value_template: "{{ value.replace('$', '') }}"
+      unit_of_measurement: "BND"
+      state_class: total
+
+    - name: USMS Water Meter Last Polled
+      state_topic: home/usms/water/meter_last_polled
+      value_template: "{{ value }}"
+
+    # Health of the water scrape on its own (ok / partial / fail)
+    - name: USMS Water Status
+      state_topic: home/usms/water/status
+      value_template: "{{ value }}"
+```
+
+**Electricity on a multi-meter account** uses the same shape on
+`home/usms/electricity/…` — worth doing if you want a per-meter `status`, because the
+legacy `home/usms/status` reports the whole cycle, not one meter.
+
+> **Do not** put `unit_of_measurement: kWh` on a water topic (or `m³` on an
+> electricity one). HA will happily accept the mismatch and your energy statistics
+> become nonsense.
 
 ## Development
 
@@ -413,15 +511,17 @@ digits are masked in logs only.
 ## Change history
 
 ### v0.15.12
-- **Multi-meter accounts** — every meter card on the dashboard is read. Electricity
-  and water each get their own `home/usms/<kind>/…` topics; the legacy topics follow
-  the electricity meter, so existing setups are unaffected.
+- **Multi-meter accounts** — every meter card on the dashboard is read. Every meter
+  gets its own `home/usms/<kind>/…` topic branch (always, even for a single meter);
+  the legacy `home/usms/*` topics alias the electricity meter, so existing setups are
+  unaffected.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
-- **Credentials that survive Compose** — `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`,
-  a `make-credentials.sh` generator with an in-file comment header, quote stripping,
-  a warning when the password contains `$`, and the password length in the startup
-  line so a truncation is visible.
+- **Credentials that survive Compose** — two documented routes (compose env, or a
+  file), `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
+  generator with an in-file comment header, quote stripping, a warning when the
+  password contains `$`, a warning when BOTH routes are set (the environment wins),
+  and the password length in the startup line so a truncation is visible.
 - **MQTT discovery** for multi-meter and water-only accounts: HA creates the sensors
   and a device per meter itself. Deliberately skipped for a single electricity meter,
   whose installation usually already has hand-written sensors.
