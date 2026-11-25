@@ -1,4 +1,5 @@
 import os
+import glob
 import io
 import re
 import sys
@@ -93,6 +94,9 @@ class CredentialsRejected(RuntimeError):
 PLAIN_PREFIX = "plain:"
 
 
+AUTODETECT_MIN_LEN = 16   # below this the false-positive rate on real passwords hurts
+
+
 def _looks_like_base64(raw):
     """The decoded text when `raw` is unambiguously base64-of-something, else None.
 
@@ -104,7 +108,9 @@ def _looks_like_base64(raw):
     decoding to control characters is treated as a literal password, not base64.
     """
     compact = re.sub(r"\s+", "", raw or "")
-    if len(compact) < 12 or len(compact) % 4 != 0:
+    # 16, not 12: at 12 characters ~1 in 1300 ordinary passwords is valid base64 and was
+    # silently decoded into a different secret. An encoded 11-character password is 16.
+    if len(compact) < AUTODETECT_MIN_LEN or len(compact) % 4 != 0:
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
         return None
@@ -117,15 +123,19 @@ def _looks_like_base64(raw):
     return text
 
 
-def _decode_prefixed(raw):
+def _decode_prefixed(raw, name="credential"):
     """(value, problem, kind) for a credential written in any accepted form.
 
     kind: 'b64' (explicit prefix), 'auto' (recognised as base64), 'plain' (forced
     literal) or None (used exactly as given).
+
+    Quotes are removed FIRST. Strip them after the decode and `"b64:AAAA"` (the quotes
+    compose keeps literally) fails the prefix test, is handed on as the literal password
+    `b64:AAAA`, and the portal rejects a credential that was correct in the file.
     """
     if raw is None:
         return None, None, None
-    stripped = raw.strip()
+    stripped = _unquote_secret(raw.strip(), name)
 
     if stripped.lower().startswith(PLAIN_PREFIX):
         return stripped[len(PLAIN_PREFIX):], None, "plain"
@@ -181,7 +191,7 @@ def _env_secret(name, default=None):
     if raw is None:
         return default
 
-    decoded, problem, kind = _decode_prefixed(raw)
+    decoded, problem, kind = _decode_prefixed(raw, name)
     if problem:
         log.warning("%s %s", name, problem)
         _CREDENTIAL_ERRORS.append(name)
@@ -215,21 +225,24 @@ def _env_int(name, default):
     raw = _env_text(name)
     if raw is None:
         return default
-    try:
-        return int(raw)
-    except ValueError:
+    # int() also accepts '1_800' and non-ASCII digits, which hides a typo instead of
+    # reporting one. Accept only an optional sign and ASCII digits.
+    if not re.fullmatch(r"-?\d+", raw.strip()):
         return _INVALID
+    return int(raw.strip())
 
 
-usms_username = _unquote_secret(_env_secret("USMS_USERNAME") or "", "USMS_USERNAME")
-usms_password = _unquote_secret(_env_secret("USMS_PASSWORD") or "", "USMS_PASSWORD")
+usms_username = _env_secret("USMS_USERNAME") or ""
+usms_password = _env_secret("USMS_PASSWORD") or ""
 selenium_host = _env_text("SELENIUM_HOST", "localhost")
 selenium_port = _env_int("SELENIUM_PORT", 4444)
 
 mqtt_broker = _env_text("MQTT_BROKER")
 mqtt_port = _env_int("MQTT_PORT", 1883)
-mqtt_username = _env_text("MQTT_USERNAME")
-mqtt_password = _env_text("MQTT_PASSWORD")
+# Same handling as the portal credential: compose interpolates '$' in every value, so a
+# broker password containing one arrives truncated and the broker refuses the CONNACK.
+mqtt_username = _unquote_secret(_env_text("MQTT_USERNAME") or "", "MQTT_USERNAME")
+mqtt_password = _unquote_secret(_env_text("MQTT_PASSWORD") or "", "MQTT_PASSWORD")
 
 scrape_interval = _env_int("SCRAPE_INTERVAL", 1800)
 
@@ -237,9 +250,6 @@ scrape_interval = _env_int("SCRAPE_INTERVAL", 1800)
 mqtt_enabled = bool(mqtt_broker) and mqtt is not None
 
 # MQTT topics
-topic_unit = "home/usms/remaining_unit"
-topic_balance = "home/usms/remaining_balance"
-topic_polled = "home/usms/meter_last_polled"
 topic_lastrun = "home/usms/last_run"
 topic_status = "home/usms/status"
 
@@ -258,6 +268,7 @@ XPATH_DASHBOARD_DIV = "/html/body/form/div[5]/table/tbody/tr/td/table[1]/tbody/t
 MIN_SCRAPE_INTERVAL = 60      # seconds; below this the portal is being hammered
 MAX_CONSECUTIVE_FAILURES = 3  # then exit(1) and let the restart policy recycle us
 PAGE_LOAD_TIMEOUT = 45        # seconds per navigation (chromedriver defaults to 300)
+HTTP_TIMEOUT = 60             # seconds for any WebDriver command (default is NO limit)
 ELEMENT_TIMEOUT = 10          # seconds per dashboard cell
 SCRAPE_RETRY_SLEEP = 5        # seconds before the single retry pass
 SELENIUM_ATTEMPTS = 5
@@ -305,9 +316,9 @@ def username_shape(value):
         return "ic", ""
     if _USERNAME_EMAIL.match(value):
         return "email", ""
-    return "unknown", ("USMS_USERNAME=%r is neither a plain IC number (digits) nor an "
+    return "unknown", ("USMS_USERNAME=%s is neither a plain IC number (digits) nor an "
                        "email address — the portal will reject it. IC numbers are entered "
-                       "without dashes or spaces." % value)
+                       "without dashes or spaces." % _mask_digits(value))
 
 
 def validate_config():
@@ -321,7 +332,12 @@ def validate_config():
         problems.append("SCRAPE_INTERVAL=%ds is below the %ds floor — refusing to "
                         "hammer the portal" % (scrape_interval, MIN_SCRAPE_INTERVAL))
 
-    for label, value in (("SELENIUM_PORT", selenium_port), ("MQTT_PORT", mqtt_port)):
+    ports = [("SELENIUM_PORT", selenium_port)]
+    if mqtt_broker:
+        # A junk MQTT_PORT in a stack that never publishes used to exit(2) — a restart
+        # loop for a variable nothing reads.
+        ports.append(("MQTT_PORT", mqtt_port))
+    for label, value in ports:
         if value is _INVALID:
             problems.append("%s must be a whole number, got %r" % (label, os.getenv(label)))
         elif not 0 < value < 65536:
@@ -345,6 +361,11 @@ def validate_config():
                     "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
                     "portal rejects it. Escape it as '$$', or paste the base64 of the "
                     "password instead — both are accepted in this same variable.")
+
+    if mqtt_password and "$" in mqtt_password:
+        log.warning("MQTT_PASSWORD contains '$' — Docker Compose interpolates that, so the "
+                    "broker receives a shortened password and will refuse the connection. "
+                    "Escape it as '$$', or paste its base64 instead (both accepted here).")
 
     if mqtt_broker and mqtt is None:
         problems.append("MQTT_BROKER is set but paho-mqtt is not installed")
@@ -626,8 +647,15 @@ def _refresh_captcha(driver, previous_src):
     driver.execute_script("arguments[0].click();", refresh[0])
 
     if not previous_src:
+        # No previous src means the image element could not be read at all. Sleeping and
+        # claiming success re-rolled the captcha ten times against the portal instead of
+        # stopping, and the log blamed the OCR.
         time.sleep(1)
-        return True
+        if _captcha_src(driver):
+            return True
+        log.warning("Captcha image is still unreadable after the refresh click — stopping "
+                    "instead of re-rolling blind.")
+        return False
 
     deadline = time.monotonic() + CAPTCHA_REFRESH_TIMEOUT
     while time.monotonic() < deadline:
@@ -707,6 +735,7 @@ def create_driver():
     """
     last_exc = None
     for attempt in range(1, SELENIUM_ATTEMPTS + 1):
+        driver = None
         try:
             driver = webdriver.Remote(
                 command_executor=f"http://{selenium_host}:{selenium_port}/wd/hub",
@@ -714,6 +743,13 @@ def create_driver():
             )
             driver.set_script_timeout(30)               # needed by the captcha cache read
             driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+            # The page-load timeout covers navigation only. Without this the HTTP client
+            # has no timeout at all, so one wedged chromedriver makes find_element/send_keys
+            # block forever: no log line, no failure counted, no auto-heal, no restart.
+            try:
+                driver.command_executor.set_timeout(HTTP_TIMEOUT)
+            except Exception as e:
+                log.debug("could not set the WebDriver HTTP timeout: %s", e)
             log.info("WebDriver session ready (attempt %d/%d)", attempt, SELENIUM_ATTEMPTS)
             log.debug("WebDriver session %s: page-load timeout %ss, script timeout 30s, "
                       "headless, session id %s", attempt, PAGE_LOAD_TIMEOUT,
@@ -721,6 +757,16 @@ def create_driver():
             return driver
         except Exception as e:
             last_exc = e
+            # A session that was created but never configured still holds a Chrome in
+            # the Selenium container; leaking it per attempt exhausts SE_NODE_MAX_SESSIONS
+            # and the next start fails for a reason that has nothing to do with the host.
+            if driver is not None:
+                try:
+                    driver.quit()
+                    log.debug("Selenium attempt %d: half-built session released.", attempt)
+                except Exception as cleanup_error:
+                    log.debug("Selenium attempt %d: releasing the session failed: %s",
+                              attempt, cleanup_error)
             log.warning("Selenium not ready yet (attempt %d/%d): %s: %s",
                         attempt, SELENIUM_ATTEMPTS, type(e).__name__, e)
             if attempt < SELENIUM_ATTEMPTS:
@@ -761,6 +807,27 @@ def _slug(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "page").lower()).strip("-")[:40] or "page"
 
 
+PAGE_DUMP_KEEP = 5
+
+
+def _rotate_page_dumps(directory="/tmp"):
+    """Keep at most PAGE_DUMP_KEEP dumps.
+
+    A crash loop writes one full DOM per cycle and nothing ever deleted them; a full /tmp
+    then stops Chrome starting, and every cycle fails for a reason unrelated to the portal.
+    """
+    try:
+        dumps = sorted(glob.glob(os.path.join(directory, "usms-fail-*.html")),
+                       key=os.path.getmtime, reverse=True)
+        for stale in dumps[PAGE_DUMP_KEEP:]:
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+    except Exception as e:
+        log.debug("page-dump rotation skipped: %s", e)
+
+
 def log_page_source(driver, label="", cycle_id="none"):
     """Log what USMS actually returned and keep the full DOM for a layout change.
 
@@ -782,6 +849,7 @@ def log_page_source(driver, label="", cycle_id="none"):
     except Exception as e:
         log.warning("cycle=%s %s — could not read the body: %s", cycle_id, label, e)
 
+    _rotate_page_dumps()
     try:
         path = f"/tmp/usms-fail-{cycle_id}-{_slug(label)}.html"
         html = driver.page_source or ""
@@ -860,11 +928,19 @@ def login(driver, cycle_id="none"):
         log_page_source(driver, "Stage 1 form missing", cycle_id)
         return False
 
-    _type(driver, "#ASPxRoundPanel1_txtUsername_I", usms_username)
-    _type(driver, "#ASPxRoundPanel1_txtPassword_I", usms_password)
-    log.debug("cycle=%s stage-1 credentials filled (%d-char username, %d-char password)",
-              cycle_id, len(usms_username or ""), len(usms_password or ""))
-    _click(driver, "#ASPxRoundPanel1_btnLogin")
+    try:
+        _type(driver, "#ASPxRoundPanel1_txtUsername_I", usms_username)
+        _type(driver, "#ASPxRoundPanel1_txtPassword_I", usms_password)
+        log.debug("cycle=%s stage-1 credentials filled (%d-char username, %d-char password)",
+                  cycle_id, len(usms_username or ""), len(usms_password or ""))
+        _click(driver, "#ASPxRoundPanel1_btnLogin")
+    except WebDriverException as e:
+        # A renamed field is a layout change: the dump is the only thing that fixes it, and
+        # this path used to raise a bare traceback instead of producing one.
+        log.warning("cycle=%s the stage-1 form changed — a field or button is gone: %s: %s",
+                    cycle_id, type(e).__name__, e)
+        log_page_source(driver, "Stage 1 form changed", cycle_id)
+        return False
     log.debug("cycle=%s stage-1 submitted, waiting for the redirect", cycle_id)
 
     # Either the captcha stage shows up (normal) or we went straight in.
@@ -882,6 +958,16 @@ def login(driver, cycle_id="none"):
         return False
 
     if "sc=" not in driver.current_url:
+        # No captcha stage — but do not take the URL as proof: the portal can answer the
+        # submit with a page that still is not the dashboard. Verify, or say so.
+        try:
+            WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                EC.presence_of_element_located((By.XPATH, XPATH_DASHBOARD_DIV)))
+        except Exception:
+            log.warning("cycle=%s stage 1 left the captcha path but the dashboard is not "
+                        "present — treating the login as failed.", cycle_id)
+            log_page_source(driver, "No dashboard after stage 1", cycle_id)
+            return False
         log.info("cycle=%s login succeeded without a captcha stage — landed on %s",
                  cycle_id, driver.current_url)
         return True
@@ -913,6 +999,13 @@ def login(driver, cycle_id="none"):
     try:
         WebDriverWait(driver, 30).until(lambda d: "ResLogin" not in d.current_url)
     except TimeoutException:
+        # The portal can reject the SECOND submit too. Reporting that as a transient
+        # failure makes main() retry the whole login, burning the attempt budget that
+        # CredentialsRejected and the parking path exist to protect.
+        if _portal_rejected_credentials(driver):
+            log_page_source(driver, "Portal rejected the credentials (stage 2)", cycle_id)
+            raise CredentialsRejected("stage 2: the portal answered 'Incorrect user "
+                                      "name and password'")
         log.warning("cycle=%s dashboard did not appear after the stage-2 submit — "
                     "dumping page state.", cycle_id)
         log_page_source(driver, "After stage 2 timeout", cycle_id)
@@ -946,6 +1039,11 @@ def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT, cycle_id="none", field
                           reads, "" if reads == 1 else "s")
                 return text
         except Exception as e:
+            # A dead session or a broken XPath is not "the cell is empty": propagating it
+            # lets the cycle fail loudly instead of burning the full timeout per field.
+            if type(e).__name__ in ("InvalidSessionIdException", "InvalidSelectorException",
+                                    "NoSuchWindowException", "InvalidArgumentException"):
+                raise
             last_error = e
         if time.monotonic() >= deadline:
             break
@@ -971,8 +1069,11 @@ def safe_get_text(driver, xpath, timeout=ELEMENT_TIMEOUT, cycle_id="none", field
 _FIELD_SHAPES = {
     "unit": (re.compile(r"^\d[\d,]*(?:\.\d+)?\s*(?:kWh|MWh|Wh|m\u00b3|m3|L|litres?|liters?|units?)$", re.I),
              "a meter reading with a unit, e.g. 1991.264 kWh or 62.320 m\u00b3"),
-    "balance": (re.compile(r"^(?:RM|BND|\$)?\s*\d[\d,]*(?:\.\d+)?$", re.I),
-                "an amount, e.g. $67.16"),
+    # A negative (arrears) or parenthesised balance is a real reading here; it used to
+    # be discarded as unreadable, freezing the sensor exactly when the account was in debit.
+    "balance": (re.compile(r"^(?:RM|BND|\$)?\s*(?:\(\s*-?\d[\d,]*(?:\.\d+)?\s*\)"
+                           r"|-?\d[\d,]*(?:\.\d+)?)$", re.I),
+                "an amount, e.g. $67.16 or -12.30"),
     "polled": (re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$"), "a date, e.g. 24/11/2026"),
 }
 
@@ -980,6 +1081,7 @@ _FIELD_SHAPES = {
 _UNIT_KINDS = (
     (re.compile(r"kwh$", re.I), "electricity"),
     (re.compile(r"mwh$", re.I), "electricity"),
+    (re.compile(r"wh$", re.I), "electricity"),        # sub-kWh reading, still electricity
     (re.compile(r"(?:m\u00b3|m3)$", re.I), "water"),
     (re.compile(r"(?:l|litres?|liters?)$", re.I), "water"),
 )
@@ -1050,9 +1152,67 @@ def _sibling_value(cell):
     return text or None
 
 
+def _card_for(cell, labels, max_levels=8):
+    """The smallest ancestor of `cell` that holds two or more meter labels.
+
+    That ancestor is one meter card. Used only when the label lists have uneven
+    lengths, where pairing them by index would attach one card's values to another
+    card's meter number — silently, and forever.
+    """
+    node = cell
+    for _ in range(max_levels):
+        try:
+            node = node.find_element(By.XPATH, "..")
+        except WebDriverException:
+            return None
+        found = 0
+        for label in labels:
+            try:
+                if node.find_elements(By.XPATH, ".//td[normalize-space(.)=%s]"
+                                      % _xpath_literal(label)):
+                    found += 1
+            except WebDriverException:
+                return None
+            if found >= 2:
+                return node
+    return None
+
+
+def _card_meter(card, cycle_id):
+    """Read one card's fields, each from the FIRST matching label INSIDE that card."""
+    meter = {}
+    for field, label in METER_LABELS:
+        try:
+            cells = card.find_elements(By.XPATH, ".//td[normalize-space(.)=%s]"
+                                       % _xpath_literal(label))
+        except WebDriverException as e:
+            log.warning("cycle=%s could not read '%s' inside a card: %s", cycle_id, label, e)
+            cells = []
+        raw = _sibling_value(cells[0]) if cells else None
+        meter[field] = raw if field == "meter_no" else validate_value(field, raw, cycle_id)
+    meter["kind"] = unit_kind(meter.get("unit"))
+    return meter
+
+
 def read_meters(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
     """Every meter card on the dashboard, in page order, with values validated."""
     started = time.monotonic()
+    # The cards are rendered by an ASP.NET postback; enumerating the instant the page
+    # "loads" can capture one card of two, and a partial set looks like a complete scrape.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if driver.find_elements(By.XPATH,
+                                    "//td[normalize-space(.)=%s]"
+                                    % _xpath_literal(dict(METER_LABELS)["unit"])):
+                break
+        except WebDriverException:
+            pass
+        if time.monotonic() >= deadline:
+            log.warning("cycle=%s no meter card appeared within %ss.", cycle_id, timeout)
+            return []
+        time.sleep(0.5)
+
     columns = {}
     for field, label in METER_LABELS:
         # normalize-space(.) not text(): the caption sits in a <span> inside the
@@ -1069,24 +1229,71 @@ def read_meters(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
     if count == 0:
         return []
 
+    counts = {field: len(cells) for field, cells in columns.items()}
     meters = []
-    for index in range(count):
-        meter = {}
-        for field, _label in METER_LABELS:
-            cells = columns[field]
-            raw = _sibling_value(cells[index]) if index < len(cells) else None
-            if field == "meter_no":
-                meter["meter_no"] = raw
-            else:
-                meter[field] = validate_value(field, raw, cycle_id)
-        meter["kind"] = unit_kind(meter.get("unit"))
-        meters.append(meter)
 
-    log.debug("cycle=%s %d meter card(s) read in %.1fs: %s", cycle_id, len(meters),
+    if len(set(counts.values())) == 1:
+        # Fast path — every label appears exactly once per card, so index N of one list
+        # is the same card as index N of every other. This is the normal case.
+        for index in range(count):
+            meter = {}
+            for field, _label in METER_LABELS:
+                raw = _sibling_value(columns[field][index])
+                meter[field] = raw if field == "meter_no" else validate_value(field, raw, cycle_id)
+            meter["kind"] = unit_kind(meter.get("unit"))
+            meters.append(meter)
+    elif len([m for m in columns["meter_no"]]) and len(set(
+            (_sibling_value(c) or "").strip() for c in columns["meter_no"])) < len(columns["meter_no"]):
+        # Same counts, but two cards report the same meter number — the signature of a
+        # stray label outside a card shifting every list by one. Card scoping is the only
+        # safe reading here.
+        log.warning("cycle=%s two cards report the same meter number — reading each card "
+                    "in its own scope rather than pairing the lists.", cycle_id)
+        labels = [label for _f, label in METER_LABELS]
+        seen = set()
+        for cell in columns["unit"]:
+            card = _card_for(cell, labels)
+            if card is None:
+                continue
+            key = getattr(card, "id", None) or id(card)
+            if key in seen:
+                continue
+            seen.add(key)
+            meters.append(_card_meter(card, cycle_id))
+    else:
+        # Uneven counts: a card missing a label, or a label rendered twice. Index N of one
+        # list is then NOT the same card as index N of another, and pairing them publishes
+        # one meter's reading under another meter's number. Scope every reading to its own
+        # card instead.
+        log.warning("cycle=%s meter cards have uneven label counts %s — reading each card "
+                    "in its own scope instead of pairing the lists.", cycle_id, counts)
+        labels = [label for _f, label in METER_LABELS]
+        seen = set()
+        for cell in columns["unit"]:
+            card = _card_for(cell, labels)
+            if card is None:
+                log.warning("cycle=%s a meter card could not be isolated — skipping it "
+                            "rather than guessing which values belong to it.", cycle_id)
+                continue
+            key = getattr(card, "id", None) or id(card)
+            if key in seen:
+                continue          # two labels in the same card map to one meter
+            seen.add(key)
+            meters.append(_card_meter(card, cycle_id))
+
+    # A label match with nothing beside it is not a meter: publishing it would fail every
+    # field, fail the cycle, and after three cycles exit the container.
+    kept = []
+    for meter in meters:
+        if all(meter.get(field) is None for field in ("meter_no", "unit", "balance", "polled")):
+            log.warning("cycle=%s ignoring a card with no readable values at all.", cycle_id)
+            continue
+        kept.append(meter)
+    log.debug("cycle=%s %d meter card(s) read in %.1fs: %s", cycle_id, len(kept),
               time.monotonic() - started,
               [{k: m.get(k) for k in ("meter_no", "kind", "unit", "balance", "polled")}
-               for m in meters])
-    return meters
+               for m in kept])
+    return kept
 
 
 def _read_dashboard_legacy(driver, timeout=ELEMENT_TIMEOUT, cycle_id="none"):
@@ -1107,54 +1314,44 @@ def _missing_fields(meter):
 
 
 def scrape_data(driver, cycle_id="none"):
-    """([meter, ...], run_time) — a meter whose field failed carries None there."""
-    log.info("cycle=%s scraping dashboard…", cycle_id)
-    _navigate(driver, DASHBOARD_URL, "dashboard", cycle_id)
-
-    meters = read_meters(driver, cycle_id=cycle_id)
+    """Reads the dashboard and retries any meter that came back incomplete."""
+    meters = read_meters(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
     if not meters:
-        log.warning("cycle=%s no meter card found by label — falling back to the "
-                    "fixed absolute XPaths.", cycle_id)
-        log_page_source(driver, "No meter card found", cycle_id)
+        log.warning("cycle=%s no meter card found — falling back to the legacy XPaths.", cycle_id)
         meters = _read_dashboard_legacy(driver, cycle_id=cycle_id)
 
     if any(_missing_fields(meter) for meter in meters):
-        problems = "; ".join(
-            "meter %s missing %s" % (meter.get("meter_no") or "n/a", ",".join(_missing_fields(meter)))
-            for meter in meters if _missing_fields(meter))
-        log_page_source(driver, "Incomplete scrape (%s)" % problems, cycle_id)
-        log.info("cycle=%s retrying the scrape after a refresh — %s", cycle_id, problems)
-
+        incomplete = [m for m in meters if _missing_fields(m)]
+        log.warning("cycle=%s %d meter(s) incomplete (%s) — retrying once.",
+                    cycle_id, len(incomplete),
+                    "; ".join("meter %s missing %s" % (m.get("meter_no") or "n/a",
+                                                       ",".join(_missing_fields(m)))
+                              for m in incomplete))
+        log_page_source(driver, "Incomplete scrape", cycle_id)
         time.sleep(SCRAPE_RETRY_SLEEP)
-        _navigate(driver, DASHBOARD_URL, "dashboard (retry)", cycle_id)
         retry = read_meters(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
         if not retry:
-            retry = _read_dashboard_legacy(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
+            retry = _read_dashboard_legacy(driver, cycle_id=cycle_id)
 
-        for index, meter in enumerate(meters):
-            if index >= len(retry):
-                break
+        # Pair by meter number, never by position: the retry is a fresh page whose card
+        # order/length is not guaranteed, so merging by index can graft meter B's reading
+        # onto meter A. No identity, no merge.
+        by_number = {r.get("meter_no"): r for r in retry if r.get("meter_no")}
+        for meter in meters:
+            number = meter.get("meter_no")
+            source = by_number.get(number) if number else None
+            if source is None:
+                continue
             for field in ("unit", "balance", "polled"):
-                if meter.get(field) is None and retry[index].get(field) is not None:
-                    meter[field] = retry[index][field]
-                    log.info("cycle=%s meter %s %s recovered on the retry: %r",
-                             cycle_id, meter.get("meter_no") or "n/a", field,
-                             retry[index][field])
-            if meter.get("kind") in (None, "meter"):
-                meter["kind"] = unit_kind(meter.get("unit"))
-
-        still = "; ".join(
-            "meter %s still missing %s" % (meter.get("meter_no") or "n/a", ",".join(_missing_fields(meter)))
-            for meter in meters if _missing_fields(meter))
-        if still:
-            log.warning("cycle=%s %s", cycle_id, still)
+                if meter.get(field) is None and source.get(field) is not None:
+                    meter[field] = source[field]
+                    log.info("cycle=%s meter %s: recovered %s on retry (%r)",
+                             cycle_id, number or "n/a", field, source[field])
 
     run_time = now_stamp()
-    for meter in meters:
-        log.info("cycle=%s meter=%s kind=%s unit=%s | balance=%s | last polled=%s | time=%s",
-                 cycle_id, meter.get("meter_no") or "n/a", meter.get("kind"),
-                 meter.get("unit") or "N/A", meter.get("balance") or "N/A",
-                 meter.get("polled") or "N/A", run_time)
+    log.debug("cycle=%s scraped %d meter(s): %s", cycle_id, len(meters),
+              [{k: m.get(k) for k in ("meter_no", "kind", "unit", "balance", "polled")}
+               for m in meters])
     return meters, run_time
 
 
@@ -1218,6 +1415,19 @@ def _meter_topic_slugs(meters):
             slugs.append("%s_%s" % (kind, re.sub(r"\W+", "", meter.get("meter_no") or str(position))))
         else:
             slugs.append(kind)
+
+    # Two meters whose numbers are equal, differ only in punctuation, or are both unreadable
+    # collapse onto one branch: the later publish overwrites the earlier and HA refuses the
+    # duplicate unique_id, so one meter silently loses its entities.
+    seen = {}
+    for position, slug in enumerate(slugs):
+        if slug in seen:
+            seen[slug] += 1
+            slugs[position] = "%s_%d" % (slug, seen[slug])
+            log.warning("meter branch collision on %r — using %r for the duplicate.",
+                        slug, slugs[position])
+        else:
+            seen[slug] = 1
     return slugs
 
 
@@ -1296,6 +1506,43 @@ def _discovery_payload(meter, slug, suffix, label, icon, extra):
     return payload
 
 
+# Slugs seen on the previous cycle. Anything that disappears is explicitly removed from
+# the broker: a retained topic nobody updates keeps showing its last reading to Home
+# Assistant forever, and a retained discovery config keeps the entity alive.
+_known_slugs = set()
+
+
+def _clear_topic(client, topic, cycle_id):
+    """Remove one retained topic by publishing an empty retained payload."""
+    try:
+        info = client.publish(topic, b"", qos=1, retain=True)
+        info.wait_for_publish(timeout=5)
+        if getattr(info, "rc", 1) == mqtt.MQTT_ERR_SUCCESS:
+            log.info("cycle=%s mqtt cleared stale topic %s", cycle_id, topic)
+            return True
+    except Exception as e:
+        log.warning("cycle=%s mqtt could not clear %s: %s: %s",
+                    cycle_id, topic, type(e).__name__, e)
+    return False
+
+
+def _clear_stale_branches(client, slugs, cycle_id):
+    """Retire the branches of meters that are no longer on the dashboard."""
+    global _known_slugs
+    current = set(slugs)
+    gone = _known_slugs - current
+    for slug in sorted(gone):
+        for suffix, _label, _icon, _extra in _DISCOVERY_FIELDS:
+            _clear_topic(client, "%s/sensor/usms_%s_%s/config" % (DISCOVERY_PREFIX, slug, suffix),
+                         cycle_id)
+        for suffix in ("remaining_unit", "remaining_balance", "meter_last_polled",
+                       "meter_no", "status"):
+            _clear_topic(client, "home/usms/%s/%s" % (slug, suffix), cycle_id)
+        log.warning("cycle=%s meter branch %r was on the last cycle but is gone now — its "
+                    "topics and Home Assistant entities have been removed.", cycle_id, slug)
+    _known_slugs = current
+
+
 def publish_discovery(client, meters, cycle_id="none"):
     """Retained discovery configs for every per-meter branch. Counts successes."""
     if not discovery_wanted(meters):
@@ -1305,6 +1552,10 @@ def publish_discovery(client, meters, cycle_id="none"):
     published = 0
     for meter, slug in zip(meters, _meter_topic_slugs(meters)):
         for suffix, label, icon, extra in _DISCOVERY_FIELDS:
+            if suffix == "meter_no" and not meter.get("meter_no"):
+                # The state topic is only published when the number was read; advertising
+                # it anyway leaves a permanently "unknown" entity pointing at nothing.
+                continue
             topic = "%s/sensor/usms_%s_%s/config" % (DISCOVERY_PREFIX, slug, suffix)
             payload = json.dumps(_discovery_payload(meter, slug, suffix, label, icon, extra))
             if _publish_topic(client, topic, payload, cycle_id):
@@ -1417,6 +1668,7 @@ def publish_mqtt(meters, run_time, cycle_id="none"):
         if client is None:
             return False
 
+        _clear_stale_branches(client, _meter_topic_slugs(meters), cycle_id)
         discovery_published = publish_discovery(client, meters, cycle_id)
         if discovery_wanted(meters):
             expected = len(meters) * len(_DISCOVERY_FIELDS)
@@ -1553,8 +1805,10 @@ def report_credentials_rejected(reason, cycle_id="none"):
     """Explain a portal credential rejection, with the numbers needed to fix it."""
     shape, shape_hint = username_shape(usms_username)
     log.critical("cycle=%s the USMS portal REJECTED the credentials (%s).", cycle_id, reason)
-    log.critical("cycle=%s   username: %r (%d chars, from %s, looks like %s)",
-                 cycle_id, usms_username, len(usms_username or ""),
+    # Masked like every other log line: these logs get pasted into issues and chat,
+    # and the IC number identifies the account holder.
+    log.critical("cycle=%s   username: %s (%d chars, from %s, looks like %s)",
+                 cycle_id, _mask_digits(usms_username), len(usms_username or ""),
                  _CREDENTIAL_SOURCE.get("USMS_USERNAME", "unset"), shape)
     log.critical("cycle=%s   password: %d chars, from %s%s", cycle_id,
                  len(usms_password or ""),
@@ -1574,11 +1828,25 @@ def report_credentials_rejected(reason, cycle_id="none"):
                  cycle_id)
 
 
-def wait_for_fixed_credentials():
+def wait_for_fixed_credentials(cycle_id="none"):
     """Park the process instead of retrying: each retry burns the portal's budget."""
     log.critical("Waiting for the credentials to be corrected. Change USMS_USERNAME / "
                  "USMS_PASSWORD and recreate the container: "
                  "docker compose up -d --force-recreate usms-scrape")
+
+    # The single state in which the scraper is definitively broken used to publish nothing:
+    # `status` kept its last retained value, so Home Assistant showed "ok" indefinitely.
+    if mqtt_enabled:
+        client = _mqtt_session(cycle_id)
+        if client is not None:
+            try:
+                _publish_topic(client, topic_status, "fail", cycle_id)
+            finally:
+                try:
+                    client.loop_stop()
+                    client.disconnect()
+                except Exception:
+                    pass
     hours = 0
     while True:
         time.sleep(3600)
@@ -1622,12 +1890,20 @@ def main():
 
         try:
             outcome = run_cycle(cycle_id)
-            cycle_ok = outcome["status"] == "ok" and outcome["published"]
+            # Deliberately the SCRAPE status only: restarting us cannot heal a broker or
+            # Home Assistant outage, and counting it here exited the container every three
+            # cycles — re-authenticating against the portal each time, the one thing that
+            # has to be rationed.
+            cycle_ok = outcome["status"] == "ok"
+            if not outcome["published"]:
+                log.warning("cycle=%s the scrape succeeded but publishing did not — not "
+                            "counted as a failure, so a broker problem cannot hammer the "
+                            "portal through our restart policy.", cycle_id)
         except CredentialsRejected as e:
             # Not a transient failure: retrying burns the portal's attempt budget and
             # ends with a locked account. Park until a human fixes the credentials.
             report_credentials_rejected(str(e), cycle_id)
-            wait_for_fixed_credentials()
+            wait_for_fixed_credentials(cycle_id)
             continue   # only reached if parking returns, which it does not
         except SystemExit:
             raise
