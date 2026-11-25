@@ -41,6 +41,8 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 | `USMS_PASSWORD`  | Account password — **route A**; breaks if the password contains `$`                | route A | N/A |
 | `USMS_USERNAME_FILE` | Path to a file holding the username — **route B**; only needed if you want nothing at all in compose | route B | N/A |
 | `USMS_PASSWORD_FILE` | Path to a file holding the password — **route B**; the route that survives `$`, quotes and spaces | route B | N/A |
+| `USMS_USERNAME_B64` | Base64 of the username — **route C**; stays inline in compose and cannot be mangled | route C | N/A |
+| `USMS_PASSWORD_B64` | Base64 of the password — **route C**; the no-file way to survive `$`, quotes and spaces | route C | N/A |
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `localhost`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address (MQTT is enabled only when this is set)                      | No       | N/A           |
@@ -56,9 +58,19 @@ per-request debug records contain the account password and IC number.
 
 ### Credentials: pick ONE route
 
-There are two ways to give the scraper the account username and password, and
-**you use one or the other — not both.** Both routes work; route A is simpler and
-route B is the one that cannot be broken by special characters.
+There are three ways to give the scraper the account username and password, and
+**you use exactly one of them.** All three stay in `docker-compose.yml` except
+route B, which needs a mount.
+
+| Route | Where the value lives | Safe with `$`? | Needs a file/mount? |
+|---|---|---|---|
+| **A** `USMS_…` | compose, plain text | no — use B or C | no |
+| **B** `USMS_…_FILE` | a file you mount in | **yes** | **yes** |
+| **C** `USMS_…_B64` | compose, base64-encoded | **yes** | **no** |
+
+**Route C is the one to reach for if the password contains `$`:** it is declared in
+the compose file like any other value (no file, no mount), and base64's alphabet
+(`A–Z a–z 0–9 + / =`) contains nothing Compose interpolates.
 
 #### Route A — in the compose file
 
@@ -83,7 +95,44 @@ password"** — the same message as a genuinely wrong password, which is why thi
 a real account days. A password that starts with `$` arrives empty and the container
 refuses to start instead.
 
-#### Route B — a file the scraper reads
+#### Route C — base64 inside the compose file (no file, no mount)
+
+Generate the two lines once:
+
+```bash
+./encode-credentials.sh
+# prompts for the IC number and the password, then prints:
+#   - USMS_USERNAME_B64=MDEwNTgyODA=
+#   - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=
+```
+
+Paste them into the compose file exactly as printed:
+
+```yaml
+environment:
+  - USMS_USERNAME_B64=MDEwNTgyODA=
+  - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=
+```
+
+That is the whole setup — no volume, no file to create, no escaping to remember.
+The scraper decodes the value at startup and logs what it got:
+
+```
+config: ... credentials username=set (b64) password=*** (14 chars, b64) ...
+```
+
+You can also encode by hand if you prefer:
+`printf '%s' 'your-password' | base64 -w0` (wrapped output is fine too — whitespace
+is ignored). An invalid value fails loudly:
+
+```
+CRITICAL config: USMS_PASSWORD_B64 could not be decoded — re-encode it: ...
+```
+
+Base64 is encoding, not encryption: anyone who can read your compose file can decode
+it. It exists to stop Compose mangling the value, not to hide it.
+
+#### Route B — a file the scraper reads (no secrets in the compose file)
 
 Nothing is interpolated in front of a file, so `$`, quotes, spaces and backslashes
 all survive.
@@ -118,24 +167,32 @@ Create the file **before** the first `up`: a bind-mount whose host path does not
 exist yet becomes an empty *directory*, and the scraper names that case explicitly
 rather than reporting a generic read error.
 
-#### Why are there two `*_FILE` variables?
+#### Why three spellings for each credential?
 
-Because they are two independent settings, and most people need only one:
+Because they are the same credential supplied three different ways, and you pick
+one:
 
-- `USMS_PASSWORD_FILE` — the useful one. Passwords contain `$`, `!`, quotes.
-- `USMS_USERNAME_FILE` — for the IC number, which is digits only and therefore
-  normally lives happily in compose. It exists so you *can* keep everything out of
-  the compose file if you prefer; `make-credentials.sh --with-username` writes it.
+- `USMS_PASSWORD` — plain, in compose. Fine when there is no `$` in the value.
+- `USMS_PASSWORD_B64` — same place, base64-encoded. Survives `$`, needs no file.
+- `USMS_PASSWORD_FILE` — a mounted file. Survives `$` and keeps the secret out of compose.
+
+The username (IC number) is digits only, so it rarely needs anything but the plain
+form; the other two exist for symmetry and for people who want nothing in the
+compose file.
 
 #### Which route do I need?
 
-| Password contains | Route A | Route B |
-|---|---|---|
-| no `$` | works | works |
-| `$` in the middle | truncated → login rejected | works |
-| starts with `$` | emptied → refuses to start | works |
-| quotes (`"` / `'`) | stripped, with a warning | works, kept as typed |
-| spaces | stripped | works, kept as typed |
+| Password contains | Route A (plain) | Route C (base64) | Route B (file) |
+|---|---|---|---|
+| no `$` | works | works | works |
+| `$` in the middle | truncated → login rejected | **works** | **works** |
+| starts with `$` | emptied → refuses to start | **works** | **works** |
+| quotes (`"` / `'`) | stripped, with a warning | works, kept as typed | works, kept as typed |
+| spaces | stripped | works, kept as typed | works, kept as typed |
+
+Pick **C** unless you specifically want the secret out of the compose file, in which
+case pick **B**. Every route logs the length it resolved, so a mangled value is
+visible in the first line of the log.
 
 Route B is also what makes the password length visible in the log
 (`USMS_PASSWORD loaded from … (11 characters)`), which is the quickest way to prove
@@ -218,8 +275,9 @@ services:
     environment:
       - USMS_USERNAME=01234567 #CHANGE (your IC number, as used on the USMS portal)
       # A password with NO dollar sign can live right here. If it contains `$`,
-      # Compose will truncate it before the container starts — double the `$`
-      # ($$) or, better, use USMS_PASSWORD_FILE from the section above.
+      # Compose truncates it before the container starts: use the base64 form
+      # (see "Credentials: pick ONE route") and no file or mount is needed:
+      #   - USMS_PASSWORD_B64=<output of ./encode-credentials.sh>
       - USMS_PASSWORD=PASSWORD123! #CHANGE (your USMS portal password)
       - SELENIUM_HOST=selenium        # must match the browser service name below
       - SELENIUM_PORT=4444
@@ -352,6 +410,8 @@ two startup lines: `config: … password=*** (N chars)` and either
 |---|---|---|
 | The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → `$$` or `USMS_PASSWORD_FILE`. |
 | `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
+| `USMS_PASSWORD_B64 is not valid base64 …` then `CRITICAL … could not be decoded` | The encoded value was truncated, or something other than base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
+| `both USMS_PASSWORD and USMS_PASSWORD_B64 are set — using the USMS_PASSWORD_B64 value` | Not an error: two routes were configured and the encoded one won. | Delete the plain line. |
 | `USMS_PASSWORD_FILE=… still contains the template placeholder` | `make-credentials.sh` ran but the file was never edited. | Replace the `PASTE-YOUR-PASSWORD-HERE` line. |
 | `USMS_PASSWORD_FILE=… is a DIRECTORY` | The bind-mount host path did not exist when the stack first started, so Docker created a directory there. | `rmdir` it, create the file, recreate the container. |
 | `USMS_PASSWORD is wrapped in " quotes — those are literal …` | Not an error: quotes inside a compose list entry are literal, so they were stripped. | Tidy the compose file when convenient. |
@@ -475,6 +535,7 @@ legacy `home/usms/status` reports the whole cycle, not one meter.
 |---|---|
 | `usms.py` | The whole scraper: config, login, captcha, meter reading, MQTT, supervisor loop |
 | `Dockerfile` | `python:3.12-slim` + selenium + paho-mqtt + ddddocr |
+| `encode-credentials.sh` | Prompts for the credentials and prints the `*_B64` compose lines (no file) |
 | `make-credentials.sh` | Writes a commented `usms_pw` for the `*_FILE` route |
 | `.github/workflows/` | Builds and pushes the image on a `v*` tag |
 
@@ -517,8 +578,8 @@ digits are masked in logs only.
   unaffected.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
-- **Credentials that survive Compose** — two documented routes (compose env, or a
-  file), `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
+- **Credentials that survive Compose** — three documented routes (plain env, base64
+  env, or a file), `encode-credentials.sh` to print the base64 compose lines,  `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
   generator with an in-file comment header, quote stripping, a warning when the
   password contains `$`, a warning when BOTH routes are set (the environment wins),
   and the password length in the startup line so a truncation is visible.

@@ -83,6 +83,38 @@ PLACEHOLDER_MARK = "PASTE-YOUR-PASSWORD-HERE"
 # validate_config() as its own problem rather than as "the variable is empty".
 _UNRESOLVED_TEMPLATES = []
 
+# A *_B64 value that would not decode — same treatment.
+_B64_ERRORS = []
+
+# Where each credential actually came from: env, b64 or file (for the log line).
+_CREDENTIAL_SOURCE = {}
+
+
+def _b64_secret(name):
+    """(value, problem) from <NAME>_B64.
+
+    THE REASON THIS EXISTS: an inline compose value is interpolated, so a password
+    containing `$` is mangled before the container starts — and a file means a mount
+    the user has to create and keep. Base64's alphabet (A–Z a–z 0–9 + / =) has no
+    `$`, no quotes and no whitespace, so an encoded password survives Compose
+    untouched and can be pasted straight into the compose file.
+    """
+    raw = os.getenv(name + "_B64")
+    if raw is None:
+        return None, None
+    compact = re.sub(r"\s+", "", raw or "")
+    if not compact:
+        return None, "%s_B64 is empty" % name
+    try:
+        decoded = base64.b64decode(compact, validate=True).decode("utf-8")
+    except Exception as e:
+        return None, ("%s_B64 is not valid base64 (or not UTF-8 once decoded): %s: %s"
+                      % (name, type(e).__name__, e))
+    decoded = decoded.strip()
+    if not decoded:
+        return None, "%s_B64 decodes to an empty value" % name
+    return decoded, None
+
 
 def _read_credential_file(path):
     """(value, problem) from a credentials file written for a human.
@@ -134,18 +166,33 @@ def _env_secret(name, default=None):
     A file we read ourselves has no interpolation in front of it, so
     `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch.
     """
+    raw_b64, b64_problem = _b64_secret(name)
     value = _env_text(name)
     path = _env_text(name + "_FILE")
 
-    # Both routes set is the trap this whole mechanism exists to prevent: the
-    # environment value WINS, so a `$`-containing password left in compose keeps
-    # overriding the good one in the file and the login keeps failing.
+    if b64_problem:
+        log.warning("%s", b64_problem)
+        _B64_ERRORS.append(name)
+
+    if raw_b64 is not None:
+        if value:
+            log.warning("both %s and %s_B64 are set — using the %s_B64 value (the plain "
+                        "one would have been mangled if it contained a '$').", name, name, name)
+        if path:
+            log.warning("both %s_B64 and %s_FILE are set — using %s_B64.", name, name, name)
+        _CREDENTIAL_SOURCE[name] = "b64"
+        return raw_b64
+
+    # Both plain/env and file set is the trap this whole mechanism exists to
+    # prevent: the environment value WINS, so a `$`-containing password left in
+    # compose keeps overriding the good one in the file.
     if value and path:
         log.warning("both %s and %s_FILE are set — the environment value WINS and the "
                     "file is IGNORED. Delete the %s line from the environment (compose) "
                     "if the file is the one that is correct.", name, name, name)
 
     if value is not None:
+        _CREDENTIAL_SOURCE[name] = "env"
         return value
 
     if not path:
@@ -158,6 +205,7 @@ def _env_secret(name, default=None):
             _UNRESOLVED_TEMPLATES.append(name)
         return default
     log.info("%s loaded from %s (%d characters)", name, path, len(text))
+    _CREDENTIAL_SOURCE[name] = "file"
     return text
 
 
@@ -275,20 +323,27 @@ def validate_config():
         elif not 0 < value < 65536:
             problems.append("%s=%s is not a valid TCP port" % (label, value))
 
-    if not usms_username and "USMS_USERNAME" not in _UNRESOLVED_TEMPLATES:
+    if (not usms_username and "USMS_USERNAME" not in _UNRESOLVED_TEMPLATES
+            and "USMS_USERNAME" not in _B64_ERRORS):
         problems.append("USMS_USERNAME is empty — set it in the stack's environment")
-    if not usms_password and "USMS_PASSWORD" not in _UNRESOLVED_TEMPLATES:
+    if (not usms_password and "USMS_PASSWORD" not in _UNRESOLVED_TEMPLATES
+            and "USMS_PASSWORD" not in _B64_ERRORS):
         problems.append("USMS_PASSWORD is empty — set it in the stack's environment")
     for name in _UNRESOLVED_TEMPLATES:
         problems.append("%s_FILE still contains the template placeholder — put the real "
                         "credential in that file (nothing else in it is parsed) and "
                         "restart." % name)
+    for name in _B64_ERRORS:
+        problems.append("%s_B64 could not be decoded — re-encode it: "
+                        "printf '%%s' 'the-password' | base64 -w0" % name)
 
     # A `$` in an environment-supplied password is the single most common cause
     # of "Incorrect user name and password" on a password that works in a
     # browser: Compose substituted it away before we ever saw it. We cannot tell
     # a truncated password from a genuine one, so say the whole story once.
-    if usms_password and "$" in usms_password and not _env_text("USMS_PASSWORD_FILE"):
+    if (usms_password and "$" in usms_password
+            and not _env_text("USMS_PASSWORD_FILE")
+            and not _env_text("USMS_PASSWORD_B64")):
         log.warning("USMS_PASSWORD contains '$' — Docker Compose interpolates that, so a "
                     "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
                     "portal rejects it. Escape it as '$$' in the compose file, or put the "
@@ -320,14 +375,16 @@ def log_startup_config():
     arrives as 5 characters. Seeing `(11 chars)` next to a password known to be
     longer is the fastest diagnosis there is.
     """
+    src_user = _CREDENTIAL_SOURCE.get("USMS_USERNAME", "unset")
+    src_pass = _CREDENTIAL_SOURCE.get("USMS_PASSWORD", "unset")
     log.info(
-        "config: interval=%ds selenium=%s:%s mqtt=%s (%s) credentials username=%s "
-        "password=%s log_level=%s timezone=%s ort_threads=%d",
+        "config: interval=%ds selenium=%s:%s mqtt=%s (%s) credentials "
+        "username=%s password=%s log_level=%s timezone=%s ort_threads=%d",
         scrape_interval, selenium_host, selenium_port,
         "on" if mqtt_enabled else "off",
         f"{mqtt_broker}:{mqtt_port}" if mqtt_broker else mqtt_disabled_reason(),
-        "set" if usms_username else "MISSING",
-        "set (%d chars)" % len(usms_password) if usms_password else "MISSING",
+        "set (%s)" % src_user if usms_username else "MISSING",
+        "set (%d chars, %s)" % (len(usms_password), src_pass) if usms_password else "MISSING",
         LOG_LEVEL, USMS_TIMEZONE,
         max(1, min(ORT_MAX_THREADS, _available_cpus())),
     )
