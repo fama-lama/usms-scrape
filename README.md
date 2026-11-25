@@ -75,8 +75,9 @@ Docker Compose substitutes `$...` **before the container starts**, so the passwo
 truncated (or empty) and the portal answers "Incorrect user name and password" — the same
 message as a wrong password. Quotation marks do not help. Encode it once:
 
-1. Open <https://emn178.github.io/online-tools/base64_encode.html> — open source, runs in
-   your browser. Keep the format on **RFC 4648**; do not choose "URL Safe".
+1. Open <https://emn178.github.io/online-tools/base64_encode.html> — open source
+   ([source](https://github.com/emn178/online-tools)), and the conversion happens in your
+   browser. Keep the format on **RFC 4648**; do not choose "URL Safe".
 2. Paste the password, copy the **Output**.
 3. Paste it into `USMS_PASSWORD` (the `b64:` prefix is optional).
 4. `docker compose up -d --force-recreate usms-scrape`
@@ -84,8 +85,7 @@ message as a wrong password. Quotation marks do not help. Encode it once:
    `password=*** (11 chars, b64)` with the real length. A shorter number means only part
    of the Output was copied.
 
-Prefer the shell? `./encode-credentials.sh` asks for the password without echoing it and
-prints the compose line.
+Only the password needs encoding. The username is the IC number, typed straight in.
 
 **Why it cannot fix this for you:** Compose deletes those characters before the process
 exists, so no image can reconstruct them. Everything after that point is automatic.
@@ -226,7 +226,7 @@ services:
       # A password with no `$` can live right here. If it contains `$`, Compose
       # truncates it before the container starts — use the base64 form instead
       # (see "Credentials" above):
-      #   - USMS_PASSWORD=<paste the output of ./encode-credentials.sh>
+      #   - USMS_PASSWORD=<paste the base64 output here>
       - USMS_PASSWORD=PASSWORD123! #CHANGE (your USMS portal password)
       - SELENIUM_HOST=selenium        # must match the browser service name below
       - SELENIUM_PORT=4444
@@ -363,7 +363,7 @@ any `WARNING USMS_PASSWORD contains '$'`, and — when the container refuses to 
 | `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
 | `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The IC has dashes, spaces or a typo. | Enter the IC as digits only, e.g. `01234567`. |
 | `CRITICAL config: USMS_PASSWORD is empty — set it in the stack's environment` then `Refusing to start with an unusable configuration.` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
-| `USMS_PASSWORD could not be decoded …` | A `b64:`/base64 value was truncated, or non-base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
+| `USMS_PASSWORD could not be decoded …` | A `b64:`/base64 value was truncated, or non-base64 was pasted. | Encode the password again (see "If the password contains `$`") and paste the whole Output. |
 | `password=*** (N chars, b64 (auto-detected))` | Not an error: the value was recognised as base64 and decoded. | Nothing — unless the password genuinely *is* that string, then write `plain:<value>`. |
 | `USMS_PASSWORD is wrapped in " quotes — those are literal …` | Not an error: quotes inside a compose list entry are literal, so they were stripped. | Tidy the compose file when convenient. |
 | The `selenium` container never turns healthy and the scraper never starts | Wrong healthcheck URL — Selenium 4.35+ answers 404 on `/wd/hub`. | Use `http://localhost:4444/wd/hub/status`. |
@@ -486,7 +486,6 @@ legacy `home/usms/status` reports the whole cycle, not one meter.
 |---|---|
 | `usms.py` | The whole scraper: config, login, captcha, meter reading, MQTT, supervisor loop |
 | `Dockerfile` | `python:3.12-slim` + selenium + paho-mqtt + ddddocr |
-| `encode-credentials.sh` | Prompts for the password without echoing it, prints the one compose line |
 | `CHANGELOG.md` | Released changes, newest first |
 | `.github/workflows/` | Builds and pushes the image on a `v*` tag |
 
@@ -527,7 +526,9 @@ digits are masked in logs only.
 - Credentials are one variable each: `USMS_USERNAME` and `USMS_PASSWORD`. The
   `*_FILE` and `*_B64` variables are gone — `USMS_PASSWORD` accepts plain, `b64:`,
   bare base64 and `plain:` in the same place.
-- Removed `make-credentials.sh`; `encode-credentials.sh` now prints a single line.
+- `make-credentials.sh` removed and `encode-credentials.sh` dropped: encoding is a
+  one-off step done on any base64 tool (link in the credentials section), not a file to
+  keep in the repository
 
 ### v0.15.12
 - **Multi-meter accounts** — every meter card on the dashboard is read. Every meter

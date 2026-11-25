@@ -95,7 +95,7 @@ PLAIN_PREFIX = "plain:"
 def _looks_like_base64(raw):
     """The decoded text when `raw` is unambiguously base64-of-something, else None.
 
-    Why guess at all: a user who pastes the output of `encode-credentials.sh`, or the
+    Why guess at all: a user who pastes a base64 value from any encoder, or the
     Base64 of their password, should not also have to remember a prefix. The test is
     deliberately conservative — the whole value must be in the base64 alphabet, its
     length a multiple of 4, at least 12 characters (so a short password can never
@@ -1497,7 +1497,7 @@ def report_credentials_rejected(reason, cycle_id="none"):
         log.critical("cycle=%s   %s", cycle_id, shape_hint)
     log.critical("cycle=%s   If the password you typed is longer than %d characters, "
                  "Docker Compose truncated it at a '$'. Fix it by putting the value in the "
-                 "same variable as b64:<base64> (./encode-credentials.sh prints it) — that "
+                 "same variable as b64:<base64> — that "
                  "survives Compose and needs no file.", cycle_id, len(usms_password or ""))
     log.critical("cycle=%s   If the length matches what you typed, the portal password "
                  "itself is different from this one: log in to https://www.usms.com.bn in a "

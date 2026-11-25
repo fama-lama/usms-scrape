@@ -3,6 +3,16 @@
 All notable changes to the USMS scraper. Versions are tagged `vX.Y.Z` and published to
 Docker Hub as `vX.Y.Z`, `stable` and `latest`.
 
+## v0.15.14
+
+### Changed
+- Encoding a password containing `$` is a one-off step on any base64 tool; the workflow is
+  documented with an open-source browser encoder. No helper script ships with the repo.
+
+### Removed
+- `encode-credentials.sh` — it saved one copy-paste and needed to be kept in step with the
+  container's parser.
+
 ## v0.15.12
 
 ### Added
@@ -11,9 +21,8 @@ Docker Hub as `vX.Y.Z`, `stable` and `latest`.
   meters share a type).
 - MQTT discovery for multi-meter and water-only accounts, so Home Assistant creates the
   per-meter sensors and one device per meter without hand-written YAML.
-- Base64 credentials: `b64:<base64>` inline in the usual variables, the equivalent
-  `USMS_USERNAME_B64` / `USMS_PASSWORD_B64`, and `USMS_*_FILE` for a mounted file.
-- `encode-credentials.sh` and `make-credentials.sh` helpers.
+- Base64 credentials: `b64:<base64>` inline in the usual variables (later versions dropped
+  the extra `*_B64` / `*_FILE` spellings — one variable now accepts both forms).
 
 ### Changed
 - Legacy `home/usms/*` topics follow the electricity meter; existing dashboards keep working.
