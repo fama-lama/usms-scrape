@@ -1,5 +1,4 @@
-
-## USMS Scraper BRUNEI 
+## USMS Scraper BRUNEI
 <img width="64" height="64" alt="usms" src="https://github.com/user-attachments/assets/e4e2fae5-b3ea-4b08-8b51-c8b1a5f4fdbf" /> 
 
 This project scrapes your USMS Smart Meter dashboard data using Selenium WebDriver and optionally publishes updates to an MQTT broker. It runs continuously at configurable intervals.
@@ -22,7 +21,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - **Value checks**: Every field is shape-checked (a reading with its unit — `… kWh` or `… m³` —, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
 - **Multi-meter accounts**: Every meter card on the dashboard is read — electricity, water or both — each published under its own `home/usms/<type>/…` topics, with the classic topics following the electricity meter so existing dashboards keep working
 - **Self-installing Home Assistant entities**: For multi-meter (or water-only) accounts the scraper also publishes retained MQTT discovery configs, so HA creates the per-meter sensors and device itself — no YAML to copy
-- **Credential handling**: the same variable accepts a **plain or a base64 password** — base64 is detected automatically, and it is the way to survive a `$` (Docker Compose interpolates `$` before the container starts; quotes do not help). Also: quote stripping, a warning when more than one form is set, the resolved password length in the startup line, and a credential check that parks instead of burning the portal's login attempts.
+- **Credential handling**: one variable per credential. `USMS_PASSWORD` accepts a **plain or a base64 password** — base64 is detected automatically, and it is the way to survive a `$` (Docker Compose interpolates `$` before the container starts; quotes do not help). Also: quote stripping, the resolved length and form in the startup line, and a credential check that parks instead of burning the portal's login attempts.
 - **Retained + QoS 1**: Publishes are retained, so a Home Assistant restart recovers the last values instantly; `home/usms/status` (`ok` / `partial` / `fail`, plus an `offline` last-will) reports scraper health
 - **Debug friendly**: Logs page title, URL and a digit-masked body preview on failure, saves the full page to `/tmp` for layout work, and ends every cycle with one greppable line —
   `cycle=dc74 result=ok meters=1 unit='1987.599 kWh' balance='$67.12' polled='24/11/2026' captcha_rolls=1 driver=0.2s login=12.9s scrape=0.1s publish=1.0s total=14.2s`
@@ -115,7 +114,7 @@ Worth knowing:
 The first thing every cycle does is log in, and the log says exactly what happened:
 
 ```
-config: ... credentials username=set (ic) password=*** (11 chars, env) ...
+config: ... credentials username=set (ic) password=*** (11 chars, plain) ...
 cycle=2e6c stage 1 accepted; solving the stage-2 captcha ...
 cycle=2e6c login successful — dashboard loaded at .../MainPage
 ```
@@ -127,8 +126,8 @@ because the portal allows only a handful of tries before it locks the account:
 ```
 CRITICAL cycle=5203 the USMS portal REJECTED the credentials
          (stage 1: the portal answered 'Incorrect user name and password').
-CRITICAL cycle=5203   username: '01234599' (8 chars, from env, looks like ic)
-CRITICAL cycle=5203   password: 16 chars, from env
+CRITICAL cycle=5203   username: '01234599' (8 chars, from plain, looks like ic)
+CRITICAL cycle=5203   password: 16 chars, from plain
 CRITICAL cycle=5203   If the password you typed is longer than 16 characters,
          Docker Compose truncated it at a '$'. Fix it by putting the value in the
          same variable as b64:<base64> ...
@@ -295,9 +294,9 @@ cycle=2e6c result=ok meters=1 unit='1976.141 kWh' balance='$67.01' polled='25/11
 cycle=2e6c sleeping 1785s (interval 1800s)
 ```
 
-**Read the first line first.** `password=*** (11 chars)` is the fastest sanity
+**Read the first line first.** `password=*** (11 chars, plain)` is the fastest sanity
 check there is: if that count is shorter than the password you set, something
-truncated it (see "Passwords containing `$`, quotes or spaces").
+truncated it (see "If the password contains `$`").
 
 A captcha the OCR cannot read confidently is re-rolled and logged as
 `captcha attempt N/10: '<code>' (n/5 models agree)`; a disagreement costs a fresh
@@ -329,7 +328,7 @@ Two things that catch people out:
 - A change to `USMS_PASSWORD` or `USMS_USERNAME` is a recreate, not a
   restart.
 
-To make upgrades deliberate, pin the version: `image: famalama/usms-scrape:v0.15.12`.
+To make upgrades deliberate, pin the version: `image: famalama/usms-scrape:v0.15.13`.
 
 ---
 
@@ -348,13 +347,14 @@ Notes:
 - Both extras are optional. Closed ports are the default and the scraper never needs them.
 - `SE_VNC_PASSWORD` protects this live view only — it is not your USMS password.
 - If you publish `7900`, keep it LAN-only or behind a VPN. Anyone who can reach it can watch and type into a browser that is logged into your meter account.
-- The live view shows the browser, not the OCR: captcha reads are logged as `Captcha attempt N/10: '<code>' (n/5 models agree)`.
+- The live view shows the browser, not the OCR: captcha reads are logged as `captcha attempt N/10: '<code>' (n/5 models agree)`.
 
 ## Troubleshooting
 
 Almost every failure is decided before the first browser request, so start with the
-two startup lines: `config: … password=*** (N chars)` and either
-`USMS_PASSWORD loaded from …` or a list of `config:` problems.
+startup lines: `config: … credentials username=set (ic) password=*** (N chars, plain|b64)`,
+any `WARNING USMS_PASSWORD contains '$'`, and — when the container refuses to start — the
+`CRITICAL config: …` lines that say what is wrong.
 
 | What you see | What it means | Fix |
 |---|---|---|
@@ -362,7 +362,7 @@ two startup lines: `config: … password=*** (N chars)` and either
 | `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
 | `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
 | `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The IC has dashes, spaces or a typo. | Enter the IC as digits only, e.g. `01234567`. |
-| `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
+| `CRITICAL config: USMS_PASSWORD is empty — set it in the stack's environment` then `Refusing to start with an unusable configuration.` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
 | `USMS_PASSWORD could not be decoded …` | A `b64:`/base64 value was truncated, or non-base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
 | `password=*** (N chars, b64 (auto-detected))` | Not an error: the value was recognised as base64 and decoded. | Nothing — unless the password genuinely *is* that string, then write `plain:<value>`. |
 | `USMS_PASSWORD is wrapped in " quotes — those are literal …` | Not an error: quotes inside a compose list entry are literal, so they were stripped. | Tidy the compose file when convenient. |
@@ -537,7 +537,7 @@ digits are masked in logs only.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
 - **Credentials that survive Compose, and are checked** — `b64:<base64>` inline in the
-  same compose variable (no file, no mount), quote stripping, a warning when the password
+  same compose variable, quote stripping, a warning when the password
   contains `$`, the password length and source in the startup line, a username shape check
   (IC digits only), and — when the portal rejects the credentials — a full diagnosis plus a
   stop-all-attempts park, so a wrong password can no longer lock the account. The variable
