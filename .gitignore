@@ -31,3 +31,7 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Compose/credential backups made by encode-credentials.sh
+*.bak-*
+*.bak-cred-*

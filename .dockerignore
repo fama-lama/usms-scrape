@@ -1,0 +1,10 @@
+# Keep the build context to what the Dockerfile actually copies.
+.git/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.log
+*.bak*
+*.md

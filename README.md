@@ -487,6 +487,7 @@ legacy `home/usms/status` reports the whole cycle, not one meter.
 | `usms.py` | The whole scraper: config, login, captcha, meter reading, MQTT, supervisor loop |
 | `Dockerfile` | `python:3.12-slim` + selenium + paho-mqtt + ddddocr |
 | `encode-credentials.sh` | Prompts for the password without echoing it, prints the one compose line |
+| `CHANGELOG.md` | Released changes, newest first |
 | `.github/workflows/` | Builds and pushes the image on a `v*` tag |
 
 Behaviour worth knowing before changing anything:
@@ -536,13 +537,11 @@ digits are masked in logs only.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
 - **Credentials that survive Compose, and are checked** — `b64:<base64>` inline in the
-  same compose variable (no file, no mount) — superseded in v0.15.13 by the single-variable
-  form
-  generator with an in-file comment header, quote stripping, a warning when the
-  password contains `$`, a warning when BOTH routes are set (the environment wins),
-  the password length and source in the startup line, a username shape check (IC digits
-  digits only), and — when the portal rejects the credentials — a full diagnosis plus a
-  stop-all-attempts park, so a wrong password can no longer lock the account.
+  same compose variable (no file, no mount), quote stripping, a warning when the password
+  contains `$`, the password length and source in the startup line, a username shape check
+  (IC digits only), and — when the portal rejects the credentials — a full diagnosis plus a
+  stop-all-attempts park, so a wrong password can no longer lock the account. The variable
+  set was reduced to one per credential in v0.15.13.
 - **MQTT discovery** for multi-meter and water-only accounts: HA creates the sensors
   and a device per meter itself. Deliberately skipped for a single electricity meter,
   whose installation usually already has hand-written sensors.

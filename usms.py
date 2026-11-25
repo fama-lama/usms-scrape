@@ -1510,7 +1510,7 @@ def report_credentials_rejected(reason, cycle_id="none"):
 def wait_for_fixed_credentials():
     """Park the process instead of retrying: each retry burns the portal's budget."""
     log.critical("Waiting for the credentials to be corrected. Change USMS_USERNAME / "
-                 "USMS_PASSWORD (or their *_B64 / *_FILE form) and recreate the container: "
+                 "USMS_PASSWORD and recreate the container: "
                  "docker compose up -d --force-recreate usms-scrape")
     hours = 0
     while True:
