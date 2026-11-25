@@ -258,7 +258,13 @@ def mqtt_disabled_reason():
 
 
 def log_startup_config():
-    """Echo the RESOLVED configuration — never the credential values."""
+    """Echo the RESOLVED configuration — never the credential values.
+
+    The password LENGTH is printed (never the value): Compose silently truncates a
+    password at the first `$`, and the only tell is that a 12-character password
+    arrives as 5 characters. Seeing `(11 chars)` next to a password known to be
+    longer is the fastest diagnosis there is.
+    """
     log.info(
         "config: interval=%ds selenium=%s:%s mqtt=%s (%s) credentials username=%s "
         "password=%s log_level=%s timezone=%s ort_threads=%d",
@@ -266,7 +272,7 @@ def log_startup_config():
         "on" if mqtt_enabled else "off",
         f"{mqtt_broker}:{mqtt_port}" if mqtt_broker else mqtt_disabled_reason(),
         "set" if usms_username else "MISSING",
-        "set" if usms_password else "MISSING",
+        "set (%d chars)" % len(usms_password) if usms_password else "MISSING",
         LOG_LEVEL, USMS_TIMEZONE,
         max(1, min(ORT_MAX_THREADS, _available_cpus())),
     )
