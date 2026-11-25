@@ -30,23 +30,23 @@ ask_password() {
 echo "# ── paste these two lines into the usms-scrape service's environment: ──"
 echo
 
-username="$(ask_password 'USMS username / IC number (blank to skip): ')"
+username="$(ask_password 'USMS username / IC number or email (blank to skip): ')"
 if [ -n "$username" ]; then
-  echo "      - USMS_USERNAME_B64=$(b64 "$username")"
-  echo "        # decodes to: $username"
+  echo "      - USMS_USERNAME=$username"
 fi
 
 password="$(ask_password 'USMS password (blank to skip): ')"
 if [ -n "$password" ]; then
-  echo "      - USMS_PASSWORD_B64=$(b64 "$password")"
+  echo "      - USMS_PASSWORD=b64:$(b64 "$password")"
   echo "        # ${#password} characters, dollar signs included"
+  echo "        # (equivalent: USMS_PASSWORD_B64=$(b64 "$password") without the b64: prefix)"
 fi
 
 echo
 echo "# ────────────────────────────────────────────────────────────────────────"
-echo "# No volume, no file. Remove any USMS_USERNAME / USMS_PASSWORD / *_FILE"
-echo "# lines for the same value — one route only, the scraper warns if it sees"
-echo "# more than one."
+echo "# No volume, no file. Remove any other USMS_USERNAME / USMS_PASSWORD /"
+echo "# *_FILE / *_B64 lines for the same value — one form only, the scraper"
+echo "# warns if it sees more than one."
 echo "#"
 echo "# Verify after 'docker compose up -d --force-recreate usms-scrape':"
 echo "#   config: ... credentials username=set (b64) password=set (N chars, b64) ..."

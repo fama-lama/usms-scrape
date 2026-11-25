@@ -58,19 +58,23 @@ per-request debug records contain the account password and IC number.
 
 ### Credentials: pick ONE route
 
-There are three ways to give the scraper the account username and password, and
-**you use exactly one of them.** All three stay in `docker-compose.yml` except
-route B, which needs a mount.
+There are four spellings of the same credential, and **you use exactly one**:
 
-| Route | Where the value lives | Safe with `$`? | Needs a file/mount? |
+| Form | Example | `$`-safe | Needs a file? |
 |---|---|---|---|
-| **A** `USMS_…` | compose, plain text | no — use B or C | no |
-| **B** `USMS_…_FILE` | a file you mount in | **yes** | **yes** |
-| **C** `USMS_…_B64` | compose, base64-encoded | **yes** | **no** |
+| plain | `- USMS_PASSWORD=PASSWORD123!` | no | no |
+| **`b64:` prefix** *(recommended when the password has `$`)* | `- USMS_PASSWORD=b64:JE5ld1Bhc3MkdzByZCE=` | **yes** | **no** |
+| separate `_B64` variable | `- USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=` | **yes** | **no** |
+| file | `- USMS_PASSWORD_FILE=/run/secrets/usms_pw` | **yes** | yes |
 
-**Route C is the one to reach for if the password contains `$`:** it is declared in
-the compose file like any other value (no file, no mount), and base64's alphabet
-(`A–Z a–z 0–9 + / =`) contains nothing Compose interpolates.
+The two base64 forms exist because Docker Compose interpolates `$` in every value it
+reads, and base64's alphabet (`A–Z a–z 0–9 + / =`) contains no `$`, so an encoded
+value passes through untouched. `b64:` is the same variable you already use — paste
+the encoded value with the prefix in front and nothing else changes.
+
+**The username** accepts an IC number (`01234567`, digits only — no dashes or
+spaces) or an email address; anything else is flagged in the log before it becomes a
+failed login.
 
 #### Route A — in the compose file
 
@@ -97,40 +101,43 @@ refuses to start instead.
 
 #### Route C — base64 inside the compose file (no file, no mount)
 
-Generate the two lines once:
+Generate the value once:
 
 ```bash
 ./encode-credentials.sh
-# prompts for the IC number and the password, then prints:
-#   - USMS_USERNAME_B64=MDEwNTgyODA=
-#   - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=
+# prompts for the IC number and password (not echoed), then prints ready-made lines:
+#   - USMS_USERNAME=01234567
+#   - USMS_PASSWORD=b64:JE5ld1Bhc3MkdzByZCE=
 ```
 
-Paste them into the compose file exactly as printed:
+Paste them into the compose file exactly as printed. That is the whole setup — no
+volume, no file to create, no `$$` escaping to remember. Two equivalent spellings
+work, pick whichever the helper gave you:
 
 ```yaml
 environment:
-  - USMS_USERNAME_B64=MDEwNTgyODA=
-  - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=
+  - USMS_PASSWORD=b64:JE5ld1Bhc3MkdzByZCE=        # prefix inside the usual variable
+  # or:
+  - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=       # separate variable, same thing
 ```
 
-That is the whole setup — no volume, no file to create, no escaping to remember.
-The scraper decodes the value at startup and logs what it got:
+By hand: `printf '%s' 'your-password' | base64 -w0`, then put `b64:` in front.
+Wrapped base64 is fine — whitespace is ignored. Startup shows which form arrived:
 
 ```
-config: ... credentials username=set (b64) password=*** (14 chars, b64) ...
+config: ... credentials username=set (ic) password=*** (14 chars, b64) ...
 ```
 
-You can also encode by hand if you prefer:
-`printf '%s' 'your-password' | base64 -w0` (wrapped output is fine too — whitespace
-is ignored). An invalid value fails loudly:
+A value that will not decode fails loudly instead of retrying a wrong password:
 
 ```
-CRITICAL config: USMS_PASSWORD_B64 could not be decoded — re-encode it: ...
+CRITICAL config: USMS_PASSWORD could not be decoded from base64 — re-encode it and use the
+b64:<output> form (or USMS_PASSWORD_B64): printf '%s' 'the-value' | base64 -w0
 ```
 
 Base64 is encoding, not encryption: anyone who can read your compose file can decode
-it. It exists to stop Compose mangling the value, not to hide it.
+it. It exists to stop Compose mangling the value, not to hide it. If that matters, use
+route B.
 
 #### Route B — a file the scraper reads (no secrets in the compose file)
 
@@ -182,7 +189,7 @@ compose file.
 
 #### Which route do I need?
 
-| Password contains | Route A (plain) | Route C (base64) | Route B (file) |
+| Password contains | plain | `b64:` in compose | file |
 |---|---|---|---|
 | no `$` | works | works | works |
 | `$` in the middle | truncated → login rejected | **works** | **works** |
@@ -190,15 +197,55 @@ compose file.
 | quotes (`"` / `'`) | stripped, with a warning | works, kept as typed | works, kept as typed |
 | spaces | stripped | works, kept as typed | works, kept as typed |
 
-Pick **C** unless you specifically want the secret out of the compose file, in which
-case pick **B**. Every route logs the length it resolved, so a mangled value is
-visible in the first line of the log.
+Pick a base64 form unless you specifically want the secret out of the compose file,
+in which case pick the file route. Every form logs the length it resolved (and where
+it came from), so a mangled value is visible in the first line of the log.
 
 Route B is also what makes the password length visible in the log
 (`USMS_PASSWORD loaded from … (11 characters)`), which is the quickest way to prove
 nothing was mangled.
 
 ---
+
+### The scraper checks your credentials
+
+The first thing every cycle does is log in, and the log says exactly what happened:
+
+```
+config: ... credentials username=set (ic) password=*** (11 chars, env) ...
+cycle=2e6c stage 1 accepted; solving the stage-2 captcha ...
+cycle=2e6c login successful — dashboard loaded at .../MainPage
+```
+
+If the **portal itself** rejects the username/password, that is treated as a
+configuration problem, not a hiccup — and the scraper **stops attempting logins**,
+because the portal allows only a handful of tries before it locks the account:
+
+```
+CRITICAL cycle=5203 the USMS portal REJECTED the credentials
+         (stage 1: the portal answered 'Incorrect user name and password').
+CRITICAL cycle=5203   username: '01234599' (8 chars, from env, looks like ic)
+CRITICAL cycle=5203   password: 16 chars, from env
+CRITICAL cycle=5203   If the password you typed is longer than 16 characters,
+         Docker Compose truncated it at a '$'. Fix it by putting the value in the
+         same variable as b64:<base64> ...
+CRITICAL cycle=5203   If the length matches what you typed, the portal password
+         itself is different from this one: log in to https://www.usms.com.bn ...
+CRITICAL Waiting for the credentials to be corrected. Change USMS_USERNAME /
+         USMS_PASSWORD ... and recreate the container
+```
+
+The container stays **up** (so `docker ps` shows it and the reason is in the log) but
+it makes no further login attempts. Fix the compose file and
+`docker compose up -d --force-recreate usms-scrape` to retry.
+
+Two things this deliberately does *not* do:
+
+- It does not count a rejected credential toward the "3 failed cycles then exit"
+  auto-heal — a restart would just burn another attempt.
+- It does not guess that a value was truncated. It cannot: Compose deletes the
+  characters before the process starts. What it gives you is the length, the source
+  and the exact fix.
 
 ## MQTT Topics Published
 
@@ -409,6 +456,8 @@ two startup lines: `config: … password=*** (N chars)` and either
 | What you see | What it means | Fix |
 |---|---|---|
 | The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → `$$` or `USMS_PASSWORD_FILE`. |
+| `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
+| `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The username has dashes, spaces or a typo. | Enter the IC as digits only, or the account's email address. |
 | `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
 | `USMS_PASSWORD_B64 is not valid base64 …` then `CRITICAL … could not be decoded` | The encoded value was truncated, or something other than base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
 | `both USMS_PASSWORD and USMS_PASSWORD_B64 are set — using the USMS_PASSWORD_B64 value` | Not an error: two routes were configured and the encoded one won. | Delete the plain line. |
@@ -578,11 +627,14 @@ digits are masked in logs only.
   unaffected.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
-- **Credentials that survive Compose** — three documented routes (plain env, base64
-  env, or a file), `encode-credentials.sh` to print the base64 compose lines,  `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
+- **Credentials that survive Compose, and are checked** — `b64:<base64>` inline in the
+  same compose variable (no file, no mount), the equivalent `*_B64` variables, or a
+  mounted file; `encode-credentials.sh` to print the base64 compose lines,  `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
   generator with an in-file comment header, quote stripping, a warning when the
   password contains `$`, a warning when BOTH routes are set (the environment wins),
-  and the password length in the startup line so a truncation is visible.
+  the password length and source in the startup line, a username shape check (IC digits
+  or email), and — when the portal rejects the credentials — a full diagnosis plus a
+  stop-all-attempts park, so a wrong password can no longer lock the account.
 - **MQTT discovery** for multi-meter and water-only accounts: HA creates the sensors
   and a device per meter itself. Deliberately skipped for a single electricity meter,
   whose installation usually already has hand-written sensors.

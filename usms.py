@@ -79,6 +79,37 @@ def _env_text(name, default=None):
 
 PLACEHOLDER_MARK = "PASTE-YOUR-PASSWORD-HERE"
 
+# A credential value may be written `b64:<base64>` to survive Docker Compose's `$`
+# interpolation while staying inline in the compose file. The prefix makes the
+# encoding explicit — there is no guessing whether a value "looks like" base64.
+B64_PREFIX = "b64:"
+
+# Credential-failure state: the portal said the username/password are wrong. This is
+# NOT a transient failure — retrying only burns the portal's attempt budget (it
+# allows 5, then locks the account), so the loop stops and waits for a human.
+class CredentialsRejected(RuntimeError):
+    pass
+
+
+def _decode_prefixed(raw):
+    """(value, problem) — decodes a `b64:`-prefixed credential, else passes through."""
+    if raw is None:
+        return None, None
+    stripped = raw.strip()
+    if not stripped.lower().startswith(B64_PREFIX):
+        return raw, None
+    payload = re.sub(r"\s+", "", stripped[len(B64_PREFIX):])
+    if not payload:
+        return None, "is prefixed b64: but has no payload after it"
+    try:
+        decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+    except Exception as e:
+        return None, ("is prefixed b64: but does not decode (%s: %s) — re-encode with "
+                      "printf '%%s' 'the-value' | base64 -w0" % (type(e).__name__, e))
+    if not decoded.strip():
+        return None, "decodes to an empty value"
+    return decoded, None
+
 # Names whose *_FILE still contains the template placeholder — reported by
 # validate_config() as its own problem rather than as "the variable is empty".
 _UNRESOLVED_TEMPLATES = []
@@ -192,8 +223,14 @@ def _env_secret(name, default=None):
                     "if the file is the one that is correct.", name, name, name)
 
     if value is not None:
-        _CREDENTIAL_SOURCE[name] = "env"
-        return value
+        prefixed = value.strip().lower().startswith(B64_PREFIX)
+        decoded, problem = _decode_prefixed(value)
+        if problem:
+            log.warning("%s %s", name, problem)
+            _B64_ERRORS.append(name)
+            return default
+        _CREDENTIAL_SOURCE[name] = "b64" if prefixed else "env"
+        return decoded
 
     if not path:
         return default
@@ -204,9 +241,15 @@ def _env_secret(name, default=None):
         if problem and PLACEHOLDER_MARK in problem:
             _UNRESOLVED_TEMPLATES.append(name)
         return default
-    log.info("%s loaded from %s (%d characters)", name, path, len(text))
-    _CREDENTIAL_SOURCE[name] = "file"
-    return text
+    prefixed = text.strip().lower().startswith(B64_PREFIX)
+    decoded, b64_problem = _decode_prefixed(text)
+    if b64_problem or decoded is None:
+        log.warning("%s_FILE=%s %s", name, path, b64_problem or "has no value")
+        _B64_ERRORS.append(name)
+        return default
+    log.info("%s loaded from %s (%d characters)", name, path, len(decoded))
+    _CREDENTIAL_SOURCE[name] = "file(b64)" if prefixed else "file"
+    return decoded
 
 
 def _unquote_secret(value, name):
@@ -306,6 +349,26 @@ def now_stamp():
     return datetime.now(local_timezone()).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# The portal's username field takes the IC number; accounts registered with an
+# email address exist too. Anything else is a typo worth flagging before it becomes
+# a failed login.
+_USERNAME_IC = re.compile(r"^\d{6,12}$")
+_USERNAME_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def username_shape(value):
+    """('ic' | 'email' | 'unknown' | 'missing', human hint)."""
+    if not value:
+        return "missing", ""
+    if _USERNAME_IC.match(value):
+        return "ic", ""
+    if _USERNAME_EMAIL.match(value):
+        return "email", ""
+    return "unknown", ("USMS_USERNAME=%r is neither a plain IC number (digits) nor an "
+                       "email address — the portal will reject it. IC numbers are entered "
+                       "without dashes or spaces." % value)
+
+
 def validate_config():
     """Fail fast, in one log line per problem, when the environment is unusable."""
     problems = []
@@ -334,8 +397,9 @@ def validate_config():
                         "credential in that file (nothing else in it is parsed) and "
                         "restart." % name)
     for name in _B64_ERRORS:
-        problems.append("%s_B64 could not be decoded — re-encode it: "
-                        "printf '%%s' 'the-password' | base64 -w0" % name)
+        problems.append("%s could not be decoded from base64 — re-encode it and use the "
+                        "b64:<output> form (or %s_B64): printf '%%s' 'the-value' | base64 -w0"
+                        % (name, name))
 
     # A `$` in an environment-supplied password is the single most common cause
     # of "Incorrect user name and password" on a password that works in a
@@ -343,7 +407,8 @@ def validate_config():
     # a truncated password from a genuine one, so say the whole story once.
     if (usms_password and "$" in usms_password
             and not _env_text("USMS_PASSWORD_FILE")
-            and not _env_text("USMS_PASSWORD_B64")):
+            and not _env_text("USMS_PASSWORD_B64")
+            and _CREDENTIAL_SOURCE.get("USMS_PASSWORD") != "b64"):
         log.warning("USMS_PASSWORD contains '$' — Docker Compose interpolates that, so a "
                     "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
                     "portal rejects it. Escape it as '$$' in the compose file, or put the "
@@ -377,13 +442,16 @@ def log_startup_config():
     """
     src_user = _CREDENTIAL_SOURCE.get("USMS_USERNAME", "unset")
     src_pass = _CREDENTIAL_SOURCE.get("USMS_PASSWORD", "unset")
+    shape, shape_hint = username_shape(usms_username)
+    if shape_hint:
+        log.warning("%s", shape_hint)
     log.info(
         "config: interval=%ds selenium=%s:%s mqtt=%s (%s) credentials "
-        "username=%s password=%s log_level=%s timezone=%s ort_threads=%d",
+        "username=%s (%s) password=%s log_level=%s timezone=%s ort_threads=%d",
         scrape_interval, selenium_host, selenium_port,
         "on" if mqtt_enabled else "off",
         f"{mqtt_broker}:{mqtt_port}" if mqtt_broker else mqtt_disabled_reason(),
-        "set (%s)" % src_user if usms_username else "MISSING",
+        "set" if usms_username else "MISSING", shape,
         "set (%d chars, %s)" % (len(usms_password), src_pass) if usms_password else "MISSING",
         LOG_LEVEL, USMS_TIMEZONE,
         max(1, min(ORT_MAX_THREADS, _available_cpus())),
@@ -824,6 +892,21 @@ def _type(driver, css_selector, text):
     el.send_keys(text)
 
 
+def _portal_rejected_credentials(driver):
+    """True when the page we are looking at is the portal's 'wrong credentials' state.
+
+    Verified against the live portal: a fresh login page contains no such text, and
+    after a rejected submit the visible body becomes
+    '… | Incorrect user name and password. | Ok'. So seeing it means the SERVER said
+    the username/password are wrong — not a timeout, not a captcha problem.
+    """
+    try:
+        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+    except Exception:
+        return False
+    return "incorrect user name" in body or "incorrect username" in body
+
+
 def login(driver, cycle_id="none"):
     """Two-stage login.
 
@@ -857,6 +940,10 @@ def login(driver, cycle_id="none"):
         WebDriverWait(driver, 30).until(
             lambda d: "sc=" in d.current_url or "ResLogin" not in d.current_url)
     except TimeoutException:
+        if _portal_rejected_credentials(driver):
+            log_page_source(driver, "Portal rejected the credentials", cycle_id)
+            raise CredentialsRejected("stage 1: the portal answered 'Incorrect user "
+                                      "name and password'")
         log.warning("cycle=%s no response to the stage-1 submit — dumping page state.",
                     cycle_id)
         log_page_source(driver, "After stage 1 timeout", cycle_id)
@@ -1464,6 +1551,44 @@ def run_cycle(cycle_id="none"):
     return {"status": status, "published": published}
 
 
+def report_credentials_rejected(reason, cycle_id="none"):
+    """Explain a portal credential rejection, with the numbers needed to fix it."""
+    shape, shape_hint = username_shape(usms_username)
+    log.critical("cycle=%s the USMS portal REJECTED the credentials (%s).", cycle_id, reason)
+    log.critical("cycle=%s   username: %r (%d chars, from %s, looks like %s)",
+                 cycle_id, usms_username, len(usms_username or ""),
+                 _CREDENTIAL_SOURCE.get("USMS_USERNAME", "unset"), shape)
+    log.critical("cycle=%s   password: %d chars, from %s%s", cycle_id,
+                 len(usms_password or ""),
+                 _CREDENTIAL_SOURCE.get("USMS_PASSWORD", "unset"),
+                 " — CONTAINS '$'" if "$" in (usms_password or "") else "")
+    if shape_hint:
+        log.critical("cycle=%s   %s", cycle_id, shape_hint)
+    log.critical("cycle=%s   If the password you typed is longer than %d characters, "
+                 "Docker Compose truncated it at a '$'. Fix it by putting the value in the "
+                 "same variable as b64:<base64> (./encode-credentials.sh prints it) — that "
+                 "survives Compose and needs no file.", cycle_id, len(usms_password or ""))
+    log.critical("cycle=%s   If the length matches what you typed, the portal password "
+                 "itself is different from this one: log in to https://www.usms.com.bn in a "
+                 "browser to confirm it, then update the compose file.", cycle_id)
+    log.critical("cycle=%s NO FURTHER LOGIN ATTEMPTS until the credentials are fixed — the "
+                 "portal allows only a handful of tries before it locks the account.",
+                 cycle_id)
+
+
+def wait_for_fixed_credentials():
+    """Park the process instead of retrying: each retry burns the portal's budget."""
+    log.critical("Waiting for the credentials to be corrected. Change USMS_USERNAME / "
+                 "USMS_PASSWORD (or their *_B64 / *_FILE form) and recreate the container: "
+                 "docker compose up -d --force-recreate usms-scrape")
+    hours = 0
+    while True:
+        time.sleep(3600)
+        hours += 1
+        log.warning("%dh parked — credentials still not changed, still not attempting a "
+                    "login. Recreate the container once they are fixed.", hours)
+
+
 def install_signal_handlers():
     """Turn SIGTERM into SystemExit so the finally block quits the WebDriver.
 
@@ -1500,6 +1625,12 @@ def main():
         try:
             outcome = run_cycle(cycle_id)
             cycle_ok = outcome["status"] == "ok" and outcome["published"]
+        except CredentialsRejected as e:
+            # Not a transient failure: retrying burns the portal's attempt budget and
+            # ends with a locked account. Park until a human fixes the credentials.
+            report_credentials_rejected(str(e), cycle_id)
+            wait_for_fixed_credentials()
+            continue   # only reached if parking returns, which it does not
         except SystemExit:
             raise
         except Exception:
