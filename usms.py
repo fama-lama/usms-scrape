@@ -91,24 +91,68 @@ class CredentialsRejected(RuntimeError):
     pass
 
 
-def _decode_prefixed(raw):
-    """(value, problem) — decodes a `b64:`-prefixed credential, else passes through."""
-    if raw is None:
-        return None, None
-    stripped = raw.strip()
-    if not stripped.lower().startswith(B64_PREFIX):
-        return raw, None
-    payload = re.sub(r"\s+", "", stripped[len(B64_PREFIX):])
-    if not payload:
-        return None, "is prefixed b64: but has no payload after it"
+PLAIN_PREFIX = "plain:"
+
+
+def _looks_like_base64(raw):
+    """The decoded text when `raw` is unambiguously base64-of-something, else None.
+
+    Why guess at all: a user who pastes the output of `encode-credentials.sh`, or the
+    Base64 of their password, should not also have to remember a prefix. The test is
+    deliberately conservative — the whole value must be in the base64 alphabet, its
+    length a multiple of 4, at least 12 characters (so a short password can never
+    collide), and it must decode to printable UTF-8 of at least 6 characters. Anything
+    decoding to control characters is treated as a literal password, not base64.
+    """
+    compact = re.sub(r"\s+", "", raw or "")
+    if len(compact) < 12 or len(compact) % 4 != 0:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
+        return None
     try:
-        decoded = base64.b64decode(payload, validate=True).decode("utf-8")
-    except Exception as e:
-        return None, ("is prefixed b64: but does not decode (%s: %s) — re-encode with "
-                      "printf '%%s' 'the-value' | base64 -w0" % (type(e).__name__, e))
-    if not decoded.strip():
-        return None, "decodes to an empty value"
-    return decoded, None
+        text = base64.b64decode(compact, validate=True).decode("utf-8")
+    except Exception:
+        return None
+    if len(text) < 6 or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    return text
+
+
+def _decode_prefixed(raw):
+    """(value, problem, kind) for a credential written in any accepted form.
+
+    kind: 'b64' (explicit prefix), 'auto' (recognised as base64), 'plain' (forced
+    literal) or None (used exactly as given).
+    """
+    if raw is None:
+        return None, None, None
+    stripped = raw.strip()
+
+    if stripped.lower().startswith(PLAIN_PREFIX):
+        return stripped[len(PLAIN_PREFIX):], None, "plain"
+
+    if stripped.lower().startswith(B64_PREFIX):
+        payload = re.sub(r"\s+", "", stripped[len(B64_PREFIX):])
+        if not payload:
+            return None, "is prefixed b64: but has no payload after it", None
+        try:
+            decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+        except Exception as e:
+            return None, ("is prefixed b64: but does not decode (%s: %s) — re-encode with "
+                          "printf '%%s' 'the-value' | base64 -w0"
+                          % (type(e).__name__, e)), None
+        if not decoded.strip():
+            return None, "decodes to an empty value", None
+        return decoded, None, "b64"
+
+    auto = _looks_like_base64(stripped)
+    if auto is not None:
+        log.warning("the credential looks like base64 and was decoded automatically to "
+                    "%d characters. If that is literally your password and not an encoding "
+                    "of it, write it as plain:<value> to switch the decoding off.", len(auto))
+        return auto, None, "auto"
+
+    return raw, None, None
 
 # Names whose *_FILE still contains the template placeholder — reported by
 # validate_config() as its own problem rather than as "the variable is empty".
@@ -223,13 +267,14 @@ def _env_secret(name, default=None):
                     "if the file is the one that is correct.", name, name, name)
 
     if value is not None:
-        prefixed = value.strip().lower().startswith(B64_PREFIX)
-        decoded, problem = _decode_prefixed(value)
+        decoded, problem, kind = _decode_prefixed(value)
         if problem:
             log.warning("%s %s", name, problem)
             _B64_ERRORS.append(name)
             return default
-        _CREDENTIAL_SOURCE[name] = "b64" if prefixed else "env"
+        _CREDENTIAL_SOURCE[name] = {
+            "b64": "b64", "auto": "b64 (auto-detected)", "plain": "env (forced plain)",
+        }.get(kind or "", "env")
         return decoded
 
     if not path:
@@ -241,14 +286,13 @@ def _env_secret(name, default=None):
         if problem and PLACEHOLDER_MARK in problem:
             _UNRESOLVED_TEMPLATES.append(name)
         return default
-    prefixed = text.strip().lower().startswith(B64_PREFIX)
-    decoded, b64_problem = _decode_prefixed(text)
+    decoded, b64_problem, kind = _decode_prefixed(text)
     if b64_problem or decoded is None:
         log.warning("%s_FILE=%s %s", name, path, b64_problem or "has no value")
         _B64_ERRORS.append(name)
         return default
     log.info("%s loaded from %s (%d characters)", name, path, len(decoded))
-    _CREDENTIAL_SOURCE[name] = "file(b64)" if prefixed else "file"
+    _CREDENTIAL_SOURCE[name] = "file(b64)" if kind in ("b64", "auto") else "file"
     return decoded
 
 
@@ -408,7 +452,7 @@ def validate_config():
     if (usms_password and "$" in usms_password
             and not _env_text("USMS_PASSWORD_FILE")
             and not _env_text("USMS_PASSWORD_B64")
-            and _CREDENTIAL_SOURCE.get("USMS_PASSWORD") != "b64"):
+            and not str(_CREDENTIAL_SOURCE.get("USMS_PASSWORD", "")).startswith("b64")):
         log.warning("USMS_PASSWORD contains '$' — Docker Compose interpolates that, so a "
                     "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
                     "portal rejects it. Escape it as '$$' in the compose file, or put the "

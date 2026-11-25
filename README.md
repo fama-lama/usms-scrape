@@ -72,6 +72,24 @@ reads, and base64's alphabet (`A–Z a–z 0–9 + / =`) contains no `$`, so an 
 value passes through untouched. `b64:` is the same variable you already use — paste
 the encoded value with the prefix in front and nothing else changes.
 
+#### Do quotation marks help?
+
+**No.** Quoting is the natural instinct and it does not work — measured against a
+real compose file (`MyP@ss$w0rd` written four different ways, read back from inside
+the container):
+
+| how it is written in compose | what the container receives |
+|---|---|
+| `- USMS_PASSWORD=MyP@ss$w0rd` | `MyP@ss` |
+| `- USMS_PASSWORD='MyP@ss$w0rd'` | `'MyP@ss'` — the quote characters become part of the value |
+| `- USMS_PASSWORD="MyP@ss$w0rd"` | `"MyP@ss"` — same |
+| `USMS_PASSWORD: 'MyP@ss$w0rd'` (map form) | `MyP@ss` |
+
+Compose interpolates the value *before* the container exists, so by the time the
+scraper runs the characters after `$` are already gone and the quotes are just more
+characters. There is no quoting style that preserves a `$`. Use one of the base64
+forms for those passwords (or `$$`, which is compose's own escape).
+
 **The username** accepts an IC number (`01234567`, digits only — no dashes or
 spaces) or an email address; anything else is flagged in the log before it becomes a
 failed login.
@@ -110,6 +128,21 @@ Generate the value once:
 #   - USMS_PASSWORD=b64:JE5ld1Bhc3MkdzByZCE=
 ```
 
+Or let it edit the compose file for you — no copy-paste at all:
+
+```bash
+./encode-credentials.sh --compose compose.yaml
+# rewrote compose.yaml
+#   set USMS_USERNAME (list form)
+#   set USMS_PASSWORD (list form)
+#   removed competing USMS_PASSWORD_B64 line
+#   backup: compose.yaml.bak-cred-20261125-091725
+```
+
+It replaces the value in place, deletes any competing `_B64` / `_FILE` line for the
+same credential (so only one form is set), and keeps a timestamped backup you can
+restore with `mv`.
+
 Paste them into the compose file exactly as printed. That is the whole setup — no
 volume, no file to create, no `$$` escaping to remember. Two equivalent spellings
 work, pick whichever the helper gave you:
@@ -121,8 +154,20 @@ environment:
   - USMS_PASSWORD_B64=JE5ld1Bhc3MkdzByZCE=       # separate variable, same thing
 ```
 
-By hand: `printf '%s' 'your-password' | base64 -w0`, then put `b64:` in front.
-Wrapped base64 is fine — whitespace is ignored. Startup shows which form arrived:
+By hand: `printf '%s' 'your-password' | base64 -w0`. **The `b64:` prefix is optional** —
+a value that is unambiguously base64 (whole value in the base64 alphabet, length a
+multiple of 4, at least 12 characters, decodes to printable text) is decoded
+automatically and logged as such:
+
+```
+WARNING the credential looks like base64 and was decoded automatically to 10 characters.
+        If that is literally your password and not an encoding of it, write it as
+        plain:<value> to switch the decoding off.
+```
+
+So pasting the raw base64 works too. If your password is genuinely base64-shaped and
+you do not want it decoded, prefix it with `plain:`. Wrapped base64 is fine —
+whitespace is ignored. Startup shows which form arrived:
 
 ```
 config: ... credentials username=set (ic) password=*** (14 chars, b64) ...
@@ -457,6 +502,7 @@ two startup lines: `config: … password=*** (N chars)` and either
 |---|---|---|
 | The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → `$$` or `USMS_PASSWORD_FILE`. |
 | `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
+| `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
 | `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The username has dashes, spaces or a typo. | Enter the IC as digits only, or the account's email address. |
 | `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
 | `USMS_PASSWORD_B64 is not valid base64 …` then `CRITICAL … could not be decoded` | The encoded value was truncated, or something other than base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
