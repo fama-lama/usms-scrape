@@ -109,8 +109,12 @@ def _looks_like_base64(raw):
     """
     compact = re.sub(r"\s+", "", raw or "")
     # 16, not 12: at 12 characters ~1 in 1300 ordinary passwords is valid base64 and was
-    # silently decoded into a different secret. An encoded 11-character password is 16.
-    if len(compact) < AUTODETECT_MIN_LEN or len(compact) % 4 != 0:
+    # silently decoded into a different secret. Padding is the exception — a value ending
+    # in '=' is base64 by construction (a 9-character password encodes to 12 characters
+    # with one '='), and a human password ending in '=' is vanishingly rare.
+    if len(compact) % 4 != 0:
+        return None
+    if len(compact) < AUTODETECT_MIN_LEN and not compact.endswith("="):
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
         return None
@@ -200,6 +204,16 @@ def _env_secret(name, default=None):
     _CREDENTIAL_SOURCE[name] = {
         "b64": "b64", "auto": "b64 (auto-detected)", "plain": "plain (forced)",
     }.get(kind or "", "plain")
+
+    # A short password's base64 is 12 characters, which is below the auto-detect floor and
+    # would otherwise be submitted as literal text with no explanation. Say it out loud
+    # rather than failing at the portal.
+    compact = re.sub(r"\s+", "", raw)
+    if (kind is None and len(compact) >= 12 and len(compact) % 4 == 0
+            and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact)):
+        log.warning("%s is used literally, but it is shaped like base64 (%d characters). "
+                    "If you pasted an encoded value, write it as b64:%s to have it decoded.",
+                    name, len(compact), "<value>")
     return decoded
 
 

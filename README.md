@@ -67,9 +67,14 @@ environment:
 | paste this | when |
 |---|---|
 | `MyPassword123` | the password has no `$` — the simple case |
-| `PASTE-BASE64-HERE` | the password has `$` — encode it once, below |
-| `b64:PASTE-BASE64-HERE` | optional explicit spelling of the base64 form |
+| `b64:PASTE-BASE64-HERE` | **the password has `$` — use this spelling** |
+| `PASTE-BASE64-HERE` | same thing without the prefix; recognised automatically when the encoded value is long enough (16+ characters) |
 | `plain:whatever` | rare: the password genuinely looks like base64 |
+
+**Use the `b64:` prefix.** A bare encoded value is only auto-detected when it is long
+enough to be unambiguous, and a short password encodes to a short string — 9 characters
+becomes 12 — which is left alone on purpose so a real password is never silently
+rewritten. With the prefix there is nothing to guess, at any length.
 
 #### If the password contains `$`
 
@@ -362,6 +367,7 @@ any `WARNING USMS_PASSWORD contains '$'`, and — when the container refuses to 
 |---|---|---|
 | The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → paste the base64 instead. |
 | `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
+| `USMS_PASSWORD is used literally, but it is shaped like base64 (12 characters)` | The value was not decoded: it is too short to auto-detect safely. | If you pasted an encoded password, write it as `b64:<value>`. |
 | `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
 | `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The IC has dashes, spaces or a typo. | Enter the IC as digits only, e.g. `01234567`. |
 | `CRITICAL config: USMS_PASSWORD is empty — set it in the stack's environment` then `Refusing to start with an unusable configuration.` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |

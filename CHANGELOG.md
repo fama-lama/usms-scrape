@@ -64,6 +64,11 @@ Docker Hub as `vX.Y.Z`, `stable` and `latest`.
 - The credentials-rejected report printed the account IC number in full while every other
   log line masks digits. It is masked now.
 
+### Changed
+- **Use the `b64:` prefix for an encoded password.** Auto-detection needs 16+ characters to
+  stay safe, and a short password encodes to a shorter string (9 characters becomes 12);
+  such a value is now used literally and says so in a warning instead of being guessed at.
+
 ## v0.15.14
 
 ### Changed
