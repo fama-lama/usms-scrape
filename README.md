@@ -368,6 +368,7 @@ any `WARNING USMS_PASSWORD contains '$'`, and — when the container refuses to 
 | `USMS_PASSWORD could not be decoded …` | A `b64:`/base64 value was truncated, or non-base64 was pasted. | Encode the password again (see "If the password contains `$`") and paste the whole Output. |
 | `password=*** (N chars, b64 (auto-detected))` | Not an error: the value was recognised as base64 and decoded. | Nothing — unless the password genuinely *is* that string, then write `plain:<value>`. |
 | `USMS_PASSWORD is wrapped in " quotes — those are literal …` | Not an error: quotes inside a compose list entry are literal, so they were stripped. | Tidy the compose file when convenient. |
+| `mqtt status=ok per-topic={… false}` — every topic false | Nothing reached the broker. MQTT was interrupted or refused; the cycle still scraped fine, so `status=ok` refers to the scrape, not the publish. | Scroll up for the `mqtt … connection failed:` line — it names the reason (`Not authorized` → fix `MQTT_USERNAME` / `MQTT_PASSWORD`; `never sent CONNACK` → wrong port or not a broker). |
 | The `selenium` container never turns healthy and the scraper never starts | Wrong healthcheck URL — Selenium 4.35+ answers 404 on `/wd/hub`. | Use `http://localhost:4444/wd/hub/status`. |
 | `unit = '62.320 m³' does not look like a kWh reading` | An image **older than v0.15.12** on a water meter: only kWh was accepted, so the unit sensor never populated. | Update to v0.15.12 or newer. |
 | `unit = '…' does not look like a meter reading with a unit` (v0.15.12+) | The cell held something other than a number with kWh/m³/L — a portal layout change or a placeholder such as `N/A`. | Check the saved page; other fields usually still publish. |
@@ -406,6 +407,10 @@ Discovery is deliberately **skipped for a single electricity meter**, because th
 the case where hand-written YAML sensors (below) usually already exist and discovery
 would create a duplicate set beside them. Everything else gets it automatically —
 including a water-only account and any account with more than one meter.
+
+If HA shows **no USMS entities at all**, check the scraper's MQTT publishes first:
+`per-topic={… false}` means nothing reached the broker, so discovery was never delivered —
+look for the `mqtt … connection failed:` line above it.
 
 Requires `MQTT_BROKER` (discovery rides the same connection) and HA's MQTT
 integration. If the entities do not appear, check the log line

@@ -8,6 +8,7 @@ import uuid
 import base64
 import signal
 import logging
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -1252,6 +1253,7 @@ def _publish_meter(client, meter, cycle_id, prefix="home/usms"):
 # would add a duplicate set beside them.
 # ---------------------------------------------------------------------------
 
+MQTT_CONNECT_TIMEOUT = 10.0   # seconds to wait for the broker's CONNACK
 DISCOVERY_PREFIX = "homeassistant"
 
 # (topic suffix, display label, icon, extra config)
@@ -1312,6 +1314,87 @@ def publish_discovery(client, meters, cycle_id="none"):
     return published
 
 
+def _reason_failed(reason_code):
+    """True when an MQTT v5/v3 reason code means the broker refused us."""
+    if reason_code is None:
+        return True
+    failing = getattr(reason_code, "is_failure", None)
+    if failing is not None:
+        return bool(failing)
+    return int(getattr(reason_code, "value", reason_code)) != 0
+
+
+def _connect_and_wait(client, cycle_id):
+    """Connect, then WAIT for the CONNACK before anyone publishes.
+
+    THE BUG THIS FIXES: `client.connect()` only starts the handshake. Until the
+    broker's CONNACK is processed by the network loop, every `publish()` returns
+    MQTT_ERR_NO_CONN — "The client is not currently connected." — and the message is
+    dropped silently. On a fast local broker the CONNACK usually wins the race, which
+    is why this looked healthy here and produced nothing at a user's site: every
+    retained value AND every discovery config was thrown away. Waiting for on_connect
+    removes the race, and a refused connection is now reported with the broker's own
+    reason instead of looking like a successful cycle.
+    """
+    ready = threading.Event()
+    outcome = {}
+
+    def _on_connect(_client, _userdata, _flags, reason_code, _properties=None):
+        outcome["rc"] = reason_code
+        ready.set()
+
+    client.on_connect = _on_connect
+
+    try:
+        client.connect(mqtt_broker, mqtt_port, 60)
+    except Exception as e:
+        return False, "TCP connect to %s:%s failed: %s: %s" % (
+            mqtt_broker, mqtt_port, type(e).__name__, e)
+
+    client.loop_start()
+    if not ready.wait(MQTT_CONNECT_TIMEOUT):
+        ready.wait(0)  # no-op, keeps the intent obvious
+        return False, ("the broker accepted TCP but never sent CONNACK within %ss — "
+                       "wrong port, not an MQTT broker, or a proxy in front of it"
+                       % MQTT_CONNECT_TIMEOUT)
+
+    reason = outcome.get("rc")
+    if _reason_failed(reason):
+        return False, "the broker refused the connection: %s — check MQTT_USERNAME / " \
+                      "MQTT_PASSWORD and any per-user ACL on the broker" % (reason,)
+    return True, None
+
+
+def _mqtt_session(cycle_id):
+    """A connected MQTT client, or None. Falls back to MQTT v3.1.1 for old brokers."""
+    for protocol, name in ((mqtt.MQTTv5, "v5"), (mqtt.MQTTv311, "v3.1.1")):
+        client = mqtt.Client(
+            client_id="",
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            protocol=protocol,
+        )
+        if mqtt_username:
+            client.username_pw_set(mqtt_username, mqtt_password)
+        client.will_set(topic_status, "offline", qos=1, retain=True)
+
+        ok, problem = _connect_and_wait(client, cycle_id)
+        if ok:
+            log.debug("cycle=%s mqtt connected to %s:%s using MQTT %s",
+                      cycle_id, mqtt_broker, mqtt_port, name)
+            return client
+
+        log.warning("cycle=%s mqtt %s connection failed: %s", cycle_id, name, problem)
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
+
+    log.error("cycle=%s mqtt could not connect to %s:%s — nothing was published this "
+              "cycle (no readings, no discovery configs)", cycle_id, mqtt_broker, mqtt_port)
+    return None
+
+
 def publish_mqtt(meters, run_time, cycle_id="none"):
     """Publish what validated. True only when EVERY meter completed cleanly.
 
@@ -1330,25 +1413,9 @@ def publish_mqtt(meters, run_time, cycle_id="none"):
     client = None
     published = {}
     try:
-        client = mqtt.Client(  # type: ignore[union-attr] — guarded by mqtt_enabled above
-            client_id="",
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[union-attr]
-            protocol=mqtt.MQTTv5,  # type: ignore[union-attr]
-        )
-        if mqtt_username:
-            client.username_pw_set(mqtt_username, mqtt_password)
-        # Last will: if this container dies, HA sees "offline" instead of stale data.
-        client.will_set(topic_status, "offline", qos=1, retain=True)
-
-        rc = client.connect(mqtt_broker, mqtt_port, 60)
-        if rc != mqtt.MQTT_ERR_SUCCESS:
-            log.error("cycle=%s mqtt connect to %s:%s returned rc=%s",
-                      cycle_id, mqtt_broker, mqtt_port, rc)
+        client = _mqtt_session(cycle_id)
+        if client is None:
             return False
-        log.debug("cycle=%s mqtt connected to %s:%s (rc=%s, will=%r)",
-                  cycle_id, mqtt_broker, mqtt_port, rc, "offline")
-
-        client.loop_start()
 
         discovery_published = publish_discovery(client, meters, cycle_id)
         if discovery_wanted(meters):

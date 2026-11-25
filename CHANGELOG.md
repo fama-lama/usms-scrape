@@ -3,6 +3,21 @@
 All notable changes to the USMS scraper. Versions are tagged `vX.Y.Z` and published to
 Docker Hub as `vX.Y.Z`, `stable` and `latest`.
 
+## v0.15.15
+
+### Fixed
+- **MQTT publishes could be dropped while the connection looked fine.** `connect()` only
+  starts the handshake; until the broker's CONNACK arrives, every `publish()` returns
+  `MQTT_ERR_NO_CONN` ("The client is not currently connected.") and the message is
+  discarded. On a fast local broker the CONNACK wins the race, which is why this looked
+  healthy in testing — at a site with a slower broker no reading and no discovery config
+  ever arrived, while the cycle logged every topic as `false`. The client now waits for
+  the CONNACK before publishing.
+- A refused connection is reported with the broker's own reason — e.g.
+  `the broker refused the connection: Not authorized — check MQTT_USERNAME / MQTT_PASSWORD`
+  — instead of an apparently successful cycle.
+- MQTT v3.1.1 is used automatically when a broker refuses MQTT v5.
+
 ## v0.15.14
 
 ### Changed
