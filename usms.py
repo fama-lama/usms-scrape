@@ -1327,12 +1327,76 @@ def _missing_fields(meter):
     return [name for name in ("unit", "balance", "polled") if meter.get(name) is None]
 
 
+def _frame_contexts(driver):
+    """The top document and every iframe on it, in page order.
+
+    One portal layout puts the meter table inside `<iframe id="MyFrame">`; a reader
+    that only ever looks at the top document finds nothing there and would retry
+    forever. Each entry is (label, enter, leave): enter switches into the context,
+    leave returns to the top document unconditionally.
+    """
+    yield "the dashboard", (lambda: None), (lambda: None)
+    try:
+        frames = (driver.find_elements(By.TAG_NAME, "iframe")
+                  + driver.find_elements(By.TAG_NAME, "frame"))
+    except WebDriverException:
+        frames = []
+    for index, frame in enumerate(frames):
+        def enter(f=frame):
+            driver.switch_to.frame(f)
+
+        def leave():
+            driver.switch_to.default_content()
+
+        yield "iframe %d of %d" % (index + 1, len(frames)), enter, leave
+
+
+def _is_blank_read(meters):
+    """True when a read produced the legacy reader's empty placeholder."""
+    return (len(meters) == 1
+            and not any(meters[0].get(f) for f in ("unit", "balance", "polled", "meter_no")))
+
+
+def _read_context(driver, cycle_id, card_timeout):
+    """Cards first, then the legacy XPaths — inside whatever context is selected."""
+    meters = read_meters(driver, timeout=card_timeout, cycle_id=cycle_id)
+    if meters:
+        return meters
+    log.warning("cycle=%s no meter card found — falling back to the legacy XPaths.", cycle_id)
+    meters = _read_dashboard_legacy(driver, cycle_id=cycle_id)
+    return [] if _is_blank_read(meters) else meters
+
+
 def scrape_data(driver, cycle_id="none"):
     """Reads the dashboard and retries any meter that came back incomplete."""
-    meters = read_meters(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
+    meters = []
+    entered = (lambda: None, lambda: None)
+    where = "the dashboard"
+    for label, enter, leave in _frame_contexts(driver):
+        try:
+            enter()
+            meters = _read_context(driver, cycle_id, ELEMENT_TIMEOUT + 5)
+        except WebDriverException as e:
+            log.warning("cycle=%s could not read %s: %s", cycle_id, label, e)
+            meters = []
+        finally:
+            try:
+                leave()
+            except WebDriverException:
+                pass
+        if meters:
+            where = label
+            entered = (enter, leave)
+            if label != "the dashboard":
+                log.info("cycle=%s meter data found inside %s", cycle_id, label)
+            break
+
     if not meters:
-        log.warning("cycle=%s no meter card found — falling back to the legacy XPaths.", cycle_id)
-        meters = _read_dashboard_legacy(driver, cycle_id=cycle_id)
+        log.warning("cycle=%s no meter found in %s — nothing to publish this cycle.",
+                    cycle_id, "any layout")
+        log_page_source(driver, "no meter card", cycle_id)
+        return [{"meter_no": None, "unit": None, "balance": None,
+                 "polled": None, "kind": "meter"}], now_stamp()
 
     if any(_missing_fields(meter) for meter in meters):
         incomplete = [m for m in meters if _missing_fields(m)]
@@ -1343,9 +1407,11 @@ def scrape_data(driver, cycle_id="none"):
                               for m in incomplete))
         log_page_source(driver, "Incomplete scrape", cycle_id)
         time.sleep(SCRAPE_RETRY_SLEEP)
-        retry = read_meters(driver, timeout=ELEMENT_TIMEOUT + 5, cycle_id=cycle_id)
-        if not retry:
-            retry = _read_dashboard_legacy(driver, cycle_id=cycle_id)
+        entered[0]()
+        try:
+            retry = _read_context(driver, cycle_id, ELEMENT_TIMEOUT + 5)
+        finally:
+            entered[1]()
 
         # Pair by meter number, never by position: the retry is a fresh page whose card
         # order/length is not guaranteed, so merging by index can graft meter B's reading
@@ -1540,6 +1606,24 @@ def _clear_topic(client, topic, cycle_id):
     return False
 
 
+def _clear_placeholder_branch(client, slugs, cycle_id):
+    """Retire the branch published when a cycle could not read any meter.
+
+    A failed cycle still publishes a placeholder device so Home Assistant shows the
+    failure instead of going quiet. Once a real meter is readable that placeholder is
+    junk, and retained topics mean it would otherwise sit there failing forever.
+    """
+    if not slugs or "meter" in slugs:
+        return
+    for suffix in ("remaining_unit", "remaining_balance", "meter_last_polled",
+                   "meter_no", "status"):
+        _clear_topic(client, "home/usms/meter/%s" % suffix, cycle_id)
+        _clear_topic(client, "%s/sensor/usms_meter_%s/config"
+                     % (DISCOVERY_PREFIX, suffix), cycle_id)
+    log.info("cycle=%s cleared the placeholder meter branch now that a real meter is readable",
+             cycle_id)
+
+
 def _clear_stale_branches(client, slugs, cycle_id):
     """Retire the branches of meters that are no longer on the dashboard."""
     global _known_slugs
@@ -1682,7 +1766,9 @@ def publish_mqtt(meters, run_time, cycle_id="none"):
         if client is None:
             return False
 
-        _clear_stale_branches(client, _meter_topic_slugs(meters), cycle_id)
+        _slugs = _meter_topic_slugs(meters)
+        _clear_stale_branches(client, _slugs, cycle_id)
+        _clear_placeholder_branch(client, _slugs, cycle_id)
         discovery_published = publish_discovery(client, meters, cycle_id)
         if discovery_wanted(meters):
             expected = len(meters) * len(_DISCOVERY_FIELDS)
