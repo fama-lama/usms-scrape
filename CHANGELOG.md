@@ -3,6 +3,22 @@
 All notable changes to the USMS scraper. Versions are tagged `vX.Y.Z` and published to
 Docker Hub as `vX.Y.Z`, `stable` and `latest`.
 
+## v0.15.16
+
+### Fixed
+- **No readings on an account whose dashboard renders the meter table inside an
+  `<iframe>`.** The reader only ever looked at the top document, so it waited for a
+  meter card that was never going to appear there, fell back to the old single-meter
+  paths, found nothing, and published a failing placeholder device. It now walks the
+  top document and then each frame, and an incomplete-read retry re-enters the frame
+  that worked.
+- **A cycle that found no meter said nothing useful.** It now logs the page title,
+  URL and masked body, and keeps the HTML so the next report can be diagnosed instead
+  of guessed at.
+- **The placeholder device stayed in Home Assistant forever.** Once a real meter is
+  readable its retained topics and discovery configs are cleared, so the dead entity
+  disappears.
+
 ## v0.15.15
 
 ### Fixed
