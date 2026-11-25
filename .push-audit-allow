@@ -1,0 +1,14 @@
+# Documented fake values this repository is allowed to contain.
+# One value per line. Anything here is treated as a placeholder by
+# ~/.hermes/skills/github/github-push-safety/scripts/push_audit.py
+# Keep only invented examples — never a real identifier or credential.
+01234567
+01234599
+55000001
+55000002
+01999999
+MyP@ss$w0rd
+MyP@ss
+192.168.1.10
+selenium
+mosquitto-test
