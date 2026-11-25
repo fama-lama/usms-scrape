@@ -61,16 +61,30 @@ container as `MyP@ss` (`$w0rd` is substituted as an empty variable), which the p
 answers with the same "Incorrect user name and password" it gives a genuinely wrong
 password. Three ways to get it right, in order of preference:
 
-1. **A file instead of an environment value** — nothing is interpolated in front of it:
+1. **A file instead of an environment value** — nothing is interpolated in front of it.
+   Generate the file first, then edit one line in it:
+   ```bash
+   ./make-credentials.sh            # writes ./usms_pw, mode 600, with instructions inside
+   $EDITOR usms_pw                  # replace the PASTE-YOUR-PASSWORD-HERE line
+   ```
    ```yaml
    environment:
      - USMS_USERNAME=01234567
-     - USMS_PASSWORD_FILE=/run/secrets/usms_pw
+     - USMS_PASSWORD_FILE=/run/secrets/usms_pw   # absolute path INSIDE the container
    volumes:
      - ./usms_pw:/run/secrets/usms_pw:ro
    ```
-   (or the same path from a Docker `secrets:` entry). The scraper logs
-   `USMS_PASSWORD loaded from … (N characters)` at startup.
+   The generated file carries a comment header; the scraper ignores `#` lines and
+   blanks and uses the first other line, so the instructions can stay in the file
+   beside the password. Until the placeholder is replaced the container refuses to
+   start and says so — a half-finished setup can never masquerade as a wrong
+   password. Startup then logs `USMS_PASSWORD loaded from … (N characters)` and the
+   config line shows `password=set (N chars)`; if N is shorter than what you typed,
+   something truncated it.
+
+   Create the file **before** the first `up`: a bind-mount whose host path does not
+   exist becomes an empty *directory*, and the scraper now names that case
+   explicitly. The same path also works as a Docker `secrets:` target.
 2. **Double every `$`** in the compose file — the same example written as
    `MyP@ss$$w0rd` reaches the container correctly:
    ```yaml

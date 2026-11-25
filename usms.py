@@ -77,17 +77,62 @@ def _env_text(name, default=None):
     return raw or default
 
 
+PLACEHOLDER_MARK = "PASTE-YOUR-PASSWORD-HERE"
+
+# Names whose *_FILE still contains the template placeholder — reported by
+# validate_config() as its own problem rather than as "the variable is empty".
+_UNRESOLVED_TEMPLATES = []
+
+
+def _read_credential_file(path):
+    """(value, problem) from a credentials file written for a human.
+
+    The file is ALLOWED to carry a comment header — `scripts/make-credentials.sh`
+    writes one — so leading blank lines and leading `#` lines are skipped and the
+    first remaining line is the credential. Anything a password might contain is
+    safe in a file: `$`, quotes, spaces, backslashes. Only a password whose own
+    first character is `#` collides with the comment rule; keep those in the
+    environment with the `$$` escape instead.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except IsADirectoryError:
+        return None, ("is a DIRECTORY. Docker creates an empty directory at a bind-mount "
+                      "path whose host file does not exist — create the file first, then "
+                      "recreate the container")
+    except OSError as e:
+        return None, "could not be read: %s: %s" % (type(e).__name__, e)
+
+    start = 0
+    while start < len(lines):
+        stripped = lines[start].strip()
+        if stripped and not stripped.startswith("#"):
+            break
+        start += 1
+
+    body = [line.strip() for line in lines[start:] if line.strip()]
+    if not body:
+        return None, "has no value line (only comments/blank lines)"
+    if len(body) > 1:
+        log.warning("%s has %d value lines — using the first and ignoring the rest",
+                    path, len(body))
+    if body[0] == PLACEHOLDER_MARK:
+        return None, "still contains the template placeholder %r" % PLACEHOLDER_MARK
+    return body[0], None
+
+
 def _env_secret(name, default=None):
     """Credential from <name>, else from the file named by <name>_FILE.
 
     A compose `environment:` value is INTERPOLATED by Docker Compose before the
-    container exists: a password containing `$` arrives truncated (`$ott` becomes
-    an empty substitution, so `MyP@ss$w0rd` reaches us as `MyP@ss`) and quotes are
-    passed through literally. Compose does this for `environment:`, for `env_file:`
-    and for `.env` alike, and no amount of quoting in the YAML stops it — only
-    `$$` does. A file we read ourselves has no interpolation in front of it, so
-    `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch
-    for those passwords.
+    container exists: a password containing `$` arrives truncated (`$w0rd` becomes
+    an empty substitution, so `MyP@ss$w0rd` reaches us as `MyP@ss`, and a password
+    that STARTS with `$` arrives completely empty) and quotes are passed through
+    literally. Compose does this for `environment:`, for `env_file:` and for
+    `.env` alike, and no amount of quoting in the YAML stops it — only `$$` does.
+    A file we read ourselves has no interpolation in front of it, so
+    `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch.
     """
     value = _env_text(name)
     if value is not None:
@@ -96,18 +141,15 @@ def _env_secret(name, default=None):
     path = _env_text(name + "_FILE")
     if not path:
         return default
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read().strip()
-    except OSError as e:
-        log.warning("%s_FILE=%s could not be read: %s: %s",
-                    name, path, type(e).__name__, e)
+
+    text, problem = _read_credential_file(path)
+    if problem or text is None:
+        log.warning("%s_FILE=%s %s", name, path, problem or "has no value")
+        if problem and PLACEHOLDER_MARK in problem:
+            _UNRESOLVED_TEMPLATES.append(name)
         return default
-    if text:
-        log.info("%s loaded from %s (%d characters)", name, path, len(text))
-        return text
-    log.warning("%s_FILE=%s is empty", name, path)
-    return default
+    log.info("%s loaded from %s (%d characters)", name, path, len(text))
+    return text
 
 
 def _unquote_secret(value, name):
@@ -224,10 +266,14 @@ def validate_config():
         elif not 0 < value < 65536:
             problems.append("%s=%s is not a valid TCP port" % (label, value))
 
-    if not usms_username:
+    if not usms_username and "USMS_USERNAME" not in _UNRESOLVED_TEMPLATES:
         problems.append("USMS_USERNAME is empty — set it in the stack's environment")
-    if not usms_password:
+    if not usms_password and "USMS_PASSWORD" not in _UNRESOLVED_TEMPLATES:
         problems.append("USMS_PASSWORD is empty — set it in the stack's environment")
+    for name in _UNRESOLVED_TEMPLATES:
+        problems.append("%s_FILE still contains the template placeholder — put the real "
+                        "credential in that file (nothing else in it is parsed) and "
+                        "restart." % name)
 
     # A `$` in an environment-supplied password is the single most common cause
     # of "Incorrect user name and password" on a password that works in a
