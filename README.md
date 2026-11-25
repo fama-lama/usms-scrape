@@ -219,14 +219,14 @@ retained value from the previous good cycle stays put.
 ```yaml
 services:
   usms-scrape:
-    image: famalama/usms-scrape:stable   # stable = current release; see "Installing and updating"
+    image: famalama/usms-scrape:latest   # latest = current release; see "Installing and updating"
     restart: unless-stopped          # survive a host reboot and the built-in auto-heal exit
     container_name: usms-scrape
     environment:
       - USMS_USERNAME=01234567 #CHANGE (your IC number, as used on the USMS portal)
-      # A password with NO dollar sign can live right here. If it contains `$`,
-      # Compose truncates it before the container starts: use the base64 form
-      # (see "Credentials" above) and no file or mount is needed:
+      # A password with no `$` can live right here. If it contains `$`, Compose
+      # truncates it before the container starts — use the base64 form instead
+      # (see "Credentials" above):
       #   - USMS_PASSWORD=<paste the output of ./encode-credentials.sh>
       - USMS_PASSWORD=PASSWORD123! #CHANGE (your USMS portal password)
       - SELENIUM_HOST=selenium        # must match the browser service name below
@@ -284,7 +284,7 @@ A healthy cycle looks like this, one line per meter plus one summary line:
 
 ```
 config: interval=1800s selenium=selenium:4444 mqtt=on (192.168.1.10:1883)
-        credentials username=set password=*** (11 chars) ...
+        credentials username=set password=*** (11 chars, plain) ...
 cycle=2e6c begin (interval=1800s, selenium=selenium:4444, mqtt=on)
 cycle=2e6c stage 1 accepted; solving the stage-2 captcha on .../ResLogin?sc=...
 cycle=2e6c captcha attempt 2/10: 'baq4v' (5/5 models agree)
@@ -313,9 +313,9 @@ publishing to MQTT when configured.
 
 | Tag | Meaning |
 |-----|---------|
-| `stable` | The current released version — run this |
-| `v0.15.12`, `v0.15.11`, … | Immutable per-release tags, for pinning |
-| `latest` | Also published and rebuilt with each release; `stable` is the one to prefer |
+| `latest` | The current release — run this |
+| `stable` | The same image, published under both names |
+| `v0.15.13`, `v0.15.12`, … | Immutable per-release tags, for pinning |
 
 ```bash
 # upgrade
