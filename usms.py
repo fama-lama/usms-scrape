@@ -77,8 +77,6 @@ def _env_text(name, default=None):
     return raw or default
 
 
-PLACEHOLDER_MARK = "PASTE-YOUR-PASSWORD-HERE"
-
 # A credential value may be written `b64:<base64>` to survive Docker Compose's `$`
 # interpolation while staying inline in the compose file. The prefix makes the
 # encoding explicit — there is no guessing whether a value "looks like" base64.
@@ -154,145 +152,43 @@ def _decode_prefixed(raw):
 
     return raw, None, None
 
-# Names whose *_FILE still contains the template placeholder — reported by
-# validate_config() as its own problem rather than as "the variable is empty".
-_UNRESOLVED_TEMPLATES = []
-
-# A *_B64 value that would not decode — same treatment.
-_B64_ERRORS = []
-
-# Where each credential actually came from: env, b64 or file (for the log line).
+# Where each credential actually came from, for the startup log line.
 _CREDENTIAL_SOURCE = {}
 
-
-def _b64_secret(name):
-    """(value, problem) from <NAME>_B64.
-
-    THE REASON THIS EXISTS: an inline compose value is interpolated, so a password
-    containing `$` is mangled before the container starts — and a file means a mount
-    the user has to create and keep. Base64's alphabet (A–Z a–z 0–9 + / =) has no
-    `$`, no quotes and no whitespace, so an encoded password survives Compose
-    untouched and can be pasted straight into the compose file.
-    """
-    raw = os.getenv(name + "_B64")
-    if raw is None:
-        return None, None
-    compact = re.sub(r"\s+", "", raw or "")
-    if not compact:
-        return None, "%s_B64 is empty" % name
-    try:
-        decoded = base64.b64decode(compact, validate=True).decode("utf-8")
-    except Exception as e:
-        return None, ("%s_B64 is not valid base64 (or not UTF-8 once decoded): %s: %s"
-                      % (name, type(e).__name__, e))
-    decoded = decoded.strip()
-    if not decoded:
-        return None, "%s_B64 decodes to an empty value" % name
-    return decoded, None
-
-
-def _read_credential_file(path):
-    """(value, problem) from a credentials file written for a human.
-
-    The file is ALLOWED to carry a comment header — `scripts/make-credentials.sh`
-    writes one — so leading blank lines and leading `#` lines are skipped and the
-    first remaining line is the credential. Anything a password might contain is
-    safe in a file: `$`, quotes, spaces, backslashes. Only a password whose own
-    first character is `#` collides with the comment rule; keep those in the
-    environment with the `$$` escape instead.
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except IsADirectoryError:
-        return None, ("is a DIRECTORY. Docker creates an empty directory at a bind-mount "
-                      "path whose host file does not exist — create the file first, then "
-                      "recreate the container")
-    except OSError as e:
-        return None, "could not be read: %s: %s" % (type(e).__name__, e)
-
-    start = 0
-    while start < len(lines):
-        stripped = lines[start].strip()
-        if stripped and not stripped.startswith("#"):
-            break
-        start += 1
-
-    body = [line.strip() for line in lines[start:] if line.strip()]
-    if not body:
-        return None, "has no value line (only comments/blank lines)"
-    if len(body) > 1:
-        log.warning("%s has %d value lines — using the first and ignoring the rest",
-                    path, len(body))
-    if body[0] == PLACEHOLDER_MARK:
-        return None, "still contains the template placeholder %r" % PLACEHOLDER_MARK
-    return body[0], None
+# Credentials that could not be decoded — reported by validate_config().
+_CREDENTIAL_ERRORS = []
 
 
 def _env_secret(name, default=None):
-    """Credential from <name>, else from the file named by <name>_FILE.
+    """One variable, three accepted forms, no extra variables to remember.
 
-    A compose `environment:` value is INTERPOLATED by Docker Compose before the
-    container exists: a password containing `$` arrives truncated (`$w0rd` becomes
-    an empty substitution, so `MyP@ss$w0rd` reaches us as `MyP@ss`, and a password
-    that STARTS with `$` arrives completely empty) and quotes are passed through
-    literally. Compose does this for `environment:`, for `env_file:` and for
-    `.env` alike, and no amount of quoting in the YAML stops it — only `$$` does.
-    A file we read ourselves has no interpolation in front of it, so
-    `<NAME>_FILE` (a Docker secret, or any bind-mounted file) is the escape hatch.
+    Docker Compose interpolates `$` in every value it reads, so a password
+    containing `$` arrives shortened — or empty if it starts with one. Base64 has no
+    `$` in its alphabet, so an encoded value survives untouched. Rather than expose
+    separate `_B64` / `_FILE` variables for that, the same variable accepts:
+
+      MyPassword123      used as written (fine when there is no `$`)
+      b64:<base64>       decoded (explicit)
+      <base64>           decoded automatically when it is unambiguously base64
+      plain:<anything>   forced literal, for a password that merely looks like base64
+
+    There is no `_FILE` route. It cost a mount and three more variable names to solve
+    a problem base64 already solves inline, and two ways to say the same thing is how
+    users end up setting both and wondering which one won.
     """
-    raw_b64, b64_problem = _b64_secret(name)
-    value = _env_text(name)
-    path = _env_text(name + "_FILE")
-
-    if b64_problem:
-        log.warning("%s", b64_problem)
-        _B64_ERRORS.append(name)
-
-    if raw_b64 is not None:
-        if value:
-            log.warning("both %s and %s_B64 are set — using the %s_B64 value (the plain "
-                        "one would have been mangled if it contained a '$').", name, name, name)
-        if path:
-            log.warning("both %s_B64 and %s_FILE are set — using %s_B64.", name, name, name)
-        _CREDENTIAL_SOURCE[name] = "b64"
-        return raw_b64
-
-    # Both plain/env and file set is the trap this whole mechanism exists to
-    # prevent: the environment value WINS, so a `$`-containing password left in
-    # compose keeps overriding the good one in the file.
-    if value and path:
-        log.warning("both %s and %s_FILE are set — the environment value WINS and the "
-                    "file is IGNORED. Delete the %s line from the environment (compose) "
-                    "if the file is the one that is correct.", name, name, name)
-
-    if value is not None:
-        decoded, problem, kind = _decode_prefixed(value)
-        if problem:
-            log.warning("%s %s", name, problem)
-            _B64_ERRORS.append(name)
-            return default
-        _CREDENTIAL_SOURCE[name] = {
-            "b64": "b64", "auto": "b64 (auto-detected)", "plain": "env (forced plain)",
-        }.get(kind or "", "env")
-        return decoded
-
-    if not path:
+    raw = _env_text(name)
+    if raw is None:
         return default
 
-    text, problem = _read_credential_file(path)
-    if problem or text is None:
-        log.warning("%s_FILE=%s %s", name, path, problem or "has no value")
-        if problem and PLACEHOLDER_MARK in problem:
-            _UNRESOLVED_TEMPLATES.append(name)
+    decoded, problem, kind = _decode_prefixed(raw)
+    if problem:
+        log.warning("%s %s", name, problem)
+        _CREDENTIAL_ERRORS.append(name)
         return default
-    decoded, b64_problem, kind = _decode_prefixed(text)
-    if b64_problem or decoded is None:
-        log.warning("%s_FILE=%s %s", name, path, b64_problem or "has no value")
-        _B64_ERRORS.append(name)
-        return default
-    log.info("%s loaded from %s (%d characters)", name, path, len(decoded))
-    _CREDENTIAL_SOURCE[name] = "file(b64)" if kind in ("b64", "auto") else "file"
+
+    _CREDENTIAL_SOURCE[name] = {
+        "b64": "b64", "auto": "b64 (auto-detected)", "plain": "plain (forced)",
+    }.get(kind or "", "plain")
     return decoded
 
 
@@ -430,33 +326,24 @@ def validate_config():
         elif not 0 < value < 65536:
             problems.append("%s=%s is not a valid TCP port" % (label, value))
 
-    if (not usms_username and "USMS_USERNAME" not in _UNRESOLVED_TEMPLATES
-            and "USMS_USERNAME" not in _B64_ERRORS):
+    if not usms_username and "USMS_USERNAME" not in _CREDENTIAL_ERRORS:
         problems.append("USMS_USERNAME is empty — set it in the stack's environment")
-    if (not usms_password and "USMS_PASSWORD" not in _UNRESOLVED_TEMPLATES
-            and "USMS_PASSWORD" not in _B64_ERRORS):
+    if not usms_password and "USMS_PASSWORD" not in _CREDENTIAL_ERRORS:
         problems.append("USMS_PASSWORD is empty — set it in the stack's environment")
-    for name in _UNRESOLVED_TEMPLATES:
-        problems.append("%s_FILE still contains the template placeholder — put the real "
-                        "credential in that file (nothing else in it is parsed) and "
-                        "restart." % name)
-    for name in _B64_ERRORS:
-        problems.append("%s could not be decoded from base64 — re-encode it and use the "
-                        "b64:<output> form (or %s_B64): printf '%%s' 'the-value' | base64 -w0"
-                        % (name, name))
+    for name in _CREDENTIAL_ERRORS:
+        problems.append("%s could not be decoded — re-encode it: "
+                        "printf '%%s' 'the-value' | base64 -w0" % name)
 
     # A `$` in an environment-supplied password is the single most common cause
     # of "Incorrect user name and password" on a password that works in a
     # browser: Compose substituted it away before we ever saw it. We cannot tell
     # a truncated password from a genuine one, so say the whole story once.
     if (usms_password and "$" in usms_password
-            and not _env_text("USMS_PASSWORD_FILE")
-            and not _env_text("USMS_PASSWORD_B64")
             and not str(_CREDENTIAL_SOURCE.get("USMS_PASSWORD", "")).startswith("b64")):
         log.warning("USMS_PASSWORD contains '$' — Docker Compose interpolates that, so a "
                     "password like MyP@ss$w0rd reaches this container as MyP@ss and the "
-                    "portal rejects it. Escape it as '$$' in the compose file, or put the "
-                    "credential in a file and set USMS_PASSWORD_FILE=/path/to/file.")
+                    "portal rejects it. Escape it as '$$', or paste the base64 of the "
+                    "password instead — both are accepted in this same variable.")
 
     if mqtt_broker and mqtt is None:
         problems.append("MQTT_BROKER is set but paho-mqtt is not installed")

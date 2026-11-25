@@ -38,11 +38,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 | Variable         | Description                                                                                     | Required | Default       |
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
 | `USMS_USERNAME`  | Account username — the IC number, digits only (no dashes or spaces)             | Yes | N/A |
-| `USMS_PASSWORD`  | Account password — **plain or base64 in the same variable**, detected automatically; plain breaks if it contains `$` | Yes | N/A |
-| `USMS_USERNAME_FILE` | Path to a file holding the username — only if you want nothing at all in the compose file | No | N/A |
-| `USMS_PASSWORD_FILE` | Path to a file holding the password — the form that keeps the secret out of the compose file | No | N/A |
-| `USMS_USERNAME_B64` | Same thing as writing base64 in `USMS_USERNAME` — explicit spelling, useful when the value would otherwise be ambiguous | No | N/A |
-| `USMS_PASSWORD_B64` | Same thing as writing base64 in `USMS_PASSWORD` — explicit spelling, cannot be mangled by Compose | No | N/A |
+| `USMS_PASSWORD`  | Account password — **plain or base64 in the same variable**, worked out automatically; plain breaks if it contains `$` | Yes | N/A |
 | `SELENIUM_HOST`  | Hostname or IP where Selenium WebDriver (e.g., Selenium Grid or standalone) is running          | Yes       | `localhost`   |
 | `SELENIUM_PORT`  | Port where Selenium WebDriver is listening                                                     | Yes       | `4444`        |
 | `MQTT_BROKER`    | MQTT broker hostname or IP address (MQTT is enabled only when this is set)                      | No       | N/A           |
@@ -58,103 +54,59 @@ per-request debug records contain the account password and IC number.
 
 ### Credentials
 
-The username is the **IC number, digits only** (no dashes, no spaces).
-
-The password is accepted in **two forms — plain or base64 — and the scraper detects which
-one it got**. You never tell it which. Only one case needs action:
-
-#### 1. Your password has no `$` in it
-
-Nothing to do — put it in the compose file like any other value:
+Two variables. Nothing else to set — the password accepts plain or base64 in the **same**
+variable and the scraper works out which it got.
 
 ```yaml
 environment:
-  - USMS_USERNAME=01234567
+  - USMS_USERNAME=01234567           # the IC number, digits only
   - USMS_PASSWORD=YOUR-PASSWORD-HERE
 ```
 
-#### 2. Your password contains `$` (or starts with `$`)
+| paste this | when |
+|---|---|
+| `MyPassword123` | the password has no `$` — the simple case |
+| `PASTE-BASE64-HERE` | the password has `$` — encode it once, below |
+| `b64:PASTE-BASE64-HERE` | optional explicit spelling of the base64 form |
+| `plain:whatever` | rare: the password genuinely looks like base64 |
 
-Docker Compose substitutes `$...` **before the container starts**, so the password
-arrives shortened (or empty) and the portal answers "Incorrect user name and
-password" — the same message as a genuinely wrong password. Quotation marks do **not**
-help. Encode it once:
+#### If the password contains `$`
 
-**Step 1 — open the encoder**
+Docker Compose substitutes `$...` **before the container starts**, so the password arrives
+truncated (or empty) and the portal answers "Incorrect user name and password" — the same
+message as a wrong password. Quotation marks do not help. Encode it once:
 
-<https://emn178.github.io/online-tools/base64_encode.html>
+1. Open <https://emn178.github.io/online-tools/base64_encode.html> — open source, runs in
+   your browser. Keep the format on **RFC 4648**; do not choose "URL Safe".
+2. Paste the password, copy the **Output**.
+3. Paste it into `USMS_PASSWORD` (the `b64:` prefix is optional).
+4. `docker compose up -d --force-recreate usms-scrape`
+5. `docker compose logs usms-scrape | head -3` — the first line must read
+   `password=*** (11 chars, b64)` with the real length. A shorter number means only part
+   of the Output was copied.
 
-Open-source page (source: [emn178/online-tools](https://github.com/emn178/online-tools));
-the conversion happens in your browser. Leave the format on the default **RFC 4648**
-— do not pick "URL Safe", which produces characters this scraper does not accept.
+Prefer the shell? `./encode-credentials.sh` asks for the password without echoing it and
+prints the compose line.
 
-**Step 2 — encode the password**
+**Why it cannot fix this for you:** Compose deletes those characters before the process
+exists, so no image can reconstruct them. Everything after that point is automatic.
 
-Type or paste the password into the input box, copy the **Output** value.
+Worth knowing:
 
-**Step 3 — paste it into compose**
+- **Quoting a `$` does not protect it.** Measured, four ways, all truncated:
 
-```yaml
-environment:
-  - USMS_USERNAME=01234567
-  - USMS_PASSWORD=PASTE-THE-OUTPUT-HERE
-```
-
-The `b64:` prefix is optional — a plain base64 value is recognised automatically.
-
-**Step 4 — recreate and check**
-
-```bash
-docker compose up -d --force-recreate usms-scrape
-docker compose logs usms-scrape | head -3
-```
-
-The first log line tells you what the scraper actually received:
-
-```
-config: ... credentials username=set (ic) password=*** (11 chars, b64) ...
-```
-
-That number must match the length of your password. If it does not, you copied only
-part of the Output line — paste the whole thing.
-
-That is it. No file, no mount, no `$$` escaping.
-
-**Why encoding is needed at all:** Compose deletes the `$...` part before the container
-starts, so the scraper receives a shortened password and cannot reconstruct it — no image
-can. That is the one thing it cannot fix for you; everything after it is automatic.
-
-#### Other ways to do it (all optional)
-
-| Instead of the website | How | When |
-|---|---|---|
-| `./encode-credentials.sh` | Prompts for the password, prints the compose lines | You have a shell on the docker host |
-| `./encode-credentials.sh --compose compose.yaml` | Edits the compose file in place, keeps a timestamped backup | You would rather not copy-paste |
-| `USMS_PASSWORD=b64:<output>` | Same as pasting plain base64, but explicit | You like being explicit |
-| `USMS_PASSWORD_B64=<output>` | Separate variable, same encoding | Preference |
-| `USMS_PASSWORD_FILE=/path` + a mounted file | The password never appears in compose | You want the secret out of the compose file entirely |
-| `$$` | Double every dollar sign: `MyP@ss$$w0rd` | Only if you have one or two `$` |
-
-Notes that save time later:
-
-- **A value that looks like base64 is decoded automatically**, so pasting the raw
-  Output works with or without the prefix. If your password is genuinely
-  base64-shaped and you do *not* want it decoded, write `plain:<password>`.
-- **Only one form may be set.** If two are, the scraper says which one it used —
-  delete the other.
-- **Quoting does not protect a `$`.** Measured, four ways, all truncated:
-
-  | written as | container receives |
+  | written as | the container receives |
   |---|---|
   | `- USMS_PASSWORD=MyP@ss$w0rd` | `MyP@ss` |
-  | `- USMS_PASSWORD='MyP@ss$w0rd'` | `'MyP@ss'` (quotes become part of the value) |
+  | `- USMS_PASSWORD='MyP@ss$w0rd'` | `'MyP@ss'` (the quotes become part of the value) |
   | `- USMS_PASSWORD="MyP@ss$w0rd"` | `"MyP@ss"` |
   | `USMS_PASSWORD: 'MyP@ss$w0rd'` | `MyP@ss` |
 
-- **The username** is the IC number (digits only, no dashes or spaces) or the account's
-  digit typos are flagged at startup.
-- Base64 is encoding, not encryption — anyone who can read your compose file can decode
-  it. If that matters, use the file form.
+- **The username is the IC number**: digits only, no dashes or spaces. A typo is flagged
+  at startup rather than sent to the portal.
+- **Base64 is encoding, not encryption** — anyone who can read the compose file can decode
+  it. If that is not acceptable, keep the value in a secrets manager and inject it at
+  deploy time.
 
 ---
 
@@ -275,7 +227,7 @@ services:
       # A password with NO dollar sign can live right here. If it contains `$`,
       # Compose truncates it before the container starts: use the base64 form
       # (see "Credentials" above) and no file or mount is needed:
-      #   - USMS_PASSWORD_B64=<output of ./encode-credentials.sh>
+      #   - USMS_PASSWORD=<paste the output of ./encode-credentials.sh>
       - USMS_PASSWORD=PASSWORD123! #CHANGE (your USMS portal password)
       - SELENIUM_HOST=selenium        # must match the browser service name below
       - SELENIUM_PORT=4444
@@ -374,7 +326,7 @@ Two things that catch people out:
 
 - `docker compose restart` does **not** fetch a new image, and does **not** apply a
   changed environment variable or volume — that needs `up -d --force-recreate`.
-- A change to `USMS_PASSWORD`, `USMS_USERNAME` or a `*_FILE` path is a recreate, not a
+- A change to `USMS_PASSWORD` or `USMS_USERNAME` is a recreate, not a
   restart.
 
 To make upgrades deliberate, pin the version: `image: famalama/usms-scrape:v0.15.12`.
@@ -406,15 +358,13 @@ two startup lines: `config: … password=*** (N chars)` and either
 
 | What you see | What it means | Fix |
 |---|---|---|
-| The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → `$$` or `USMS_PASSWORD_FILE`. |
+| The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → paste the base64 instead. |
 | `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
 | `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
 | `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The IC has dashes, spaces or a typo. | Enter the IC as digits only, e.g. `01234567`. |
 | `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
-| `USMS_PASSWORD_B64 is not valid base64 …` then `CRITICAL … could not be decoded` | The encoded value was truncated, or something other than base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
-| `both USMS_PASSWORD and USMS_PASSWORD_B64 are set — using the USMS_PASSWORD_B64 value` | Not an error: two routes were configured and the encoded one won. | Delete the plain line. |
-| `USMS_PASSWORD_FILE=… still contains the template placeholder` | `make-credentials.sh` ran but the file was never edited. | Replace the `PASTE-YOUR-PASSWORD-HERE` line. |
-| `USMS_PASSWORD_FILE=… is a DIRECTORY` | The bind-mount host path did not exist when the stack first started, so Docker created a directory there. | `rmdir` it, create the file, recreate the container. |
+| `USMS_PASSWORD could not be decoded …` | A `b64:`/base64 value was truncated, or non-base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
+| `password=*** (N chars, b64 (auto-detected))` | Not an error: the value was recognised as base64 and decoded. | Nothing — unless the password genuinely *is* that string, then write `plain:<value>`. |
 | `USMS_PASSWORD is wrapped in " quotes — those are literal …` | Not an error: quotes inside a compose list entry are literal, so they were stripped. | Tidy the compose file when convenient. |
 | The `selenium` container never turns healthy and the scraper never starts | Wrong healthcheck URL — Selenium 4.35+ answers 404 on `/wd/hub`. | Use `http://localhost:4444/wd/hub/status`. |
 | `unit = '62.320 m³' does not look like a kWh reading` | An image **older than v0.15.12** on a water meter: only kWh was accepted, so the unit sensor never populated. | Update to v0.15.12 or newer. |
@@ -536,8 +486,7 @@ legacy `home/usms/status` reports the whole cycle, not one meter.
 |---|---|
 | `usms.py` | The whole scraper: config, login, captcha, meter reading, MQTT, supervisor loop |
 | `Dockerfile` | `python:3.12-slim` + selenium + paho-mqtt + ddddocr |
-| `encode-credentials.sh` | Prompts for the credentials and prints the `*_B64` compose lines (no file) |
-| `make-credentials.sh` | Writes a commented `usms_pw` for the `*_FILE` route |
+| `encode-credentials.sh` | Prompts for the password without echoing it, prints the one compose line |
 | `.github/workflows/` | Builds and pushes the image on a `v*` tag |
 
 Behaviour worth knowing before changing anything:
@@ -572,6 +521,13 @@ digits are masked in logs only.
 
 ## Change history
 
+### v0.15.13
+
+- Credentials are one variable each: `USMS_USERNAME` and `USMS_PASSWORD`. The
+  `*_FILE` and `*_B64` variables are gone — `USMS_PASSWORD` accepts plain, `b64:`,
+  bare base64 and `plain:` in the same place.
+- Removed `make-credentials.sh`; `encode-credentials.sh` now prints a single line.
+
 ### v0.15.12
 - **Multi-meter accounts** — every meter card on the dashboard is read. Every meter
   gets its own `home/usms/<kind>/…` topic branch (always, even for a single meter);
@@ -580,8 +536,8 @@ digits are masked in logs only.
 - **Water/volume readings** (`m³`, `m3`, `L`) pass validation. They used to be
   discarded as "not a kWh reading", which left the unit sensor permanently unknown.
 - **Credentials that survive Compose, and are checked** — `b64:<base64>` inline in the
-  same compose variable (no file, no mount), the equivalent `*_B64` variables, or a
-  mounted file; `encode-credentials.sh` to print the base64 compose lines,  `USMS_USERNAME_FILE` / `USMS_PASSWORD_FILE`, a `make-credentials.sh`
+  same compose variable (no file, no mount) — superseded in v0.15.13 by the single-variable
+  form
   generator with an in-file comment header, quote stripping, a warning when the
   password contains `$`, a warning when BOTH routes are set (the environment wins),
   the password length and source in the startup line, a username shape check (IC digits

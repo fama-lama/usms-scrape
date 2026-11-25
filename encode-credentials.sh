@@ -1,124 +1,78 @@
 #!/usr/bin/env bash
-# Put a password into docker-compose.yml in a form Compose cannot mangle.
+# Encode the USMS password so Docker Compose cannot mangle a '$'.
 #
-#   ./encode-credentials.sh                     # prints the lines to paste
-#   ./encode-credentials.sh --compose compose.yaml
-#                                               # rewrites the file itself (backup kept)
+#   ./encode-credentials.sh                        # print the line to paste
+#   ./encode-credentials.sh --compose compose.yaml # rewrite the file (backup kept)
 #
-# WHY THIS EXISTS — Docker Compose INTERPOLATES `$` in every value it reads
-# (environment:, env_file:, .env). A password like `$ecret1` arrives EMPTY and
-# `MyP@ss$w0rd` arrives as `MyP@ss`, before the container ever starts, and the portal
-# then answers "Incorrect user name and password" — the same message as a genuinely
-# wrong password. Nothing in the image can recover those characters: they are gone
-# before the process exists. Base64 (A–Z a–z 0–9 + / =) contains no `$`, so an encoded
-# value passes through untouched, and the scraper decodes it at startup.
-#
-# With --compose there is no copy-paste step: the script replaces the USMS_PASSWORD
-# line (and USMS_USERNAME, if you give one) in place, writes a timestamped backup
-# beside it, and reports what changed.
+# WHY: Compose interpolates `$` in every value it reads, so `MyP@ss$w0rd` arrives as
+# `MyP@ss` before the container starts. Base64 has no `$` in its alphabet, so it passes
+# through untouched and the scraper decodes it — in the same variable, no extra setting.
+# Nothing in the image can recover characters Compose deleted before the process existed.
 set -euo pipefail
 
-b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
-
-ask() {
-  local prompt="$1" value
-  printf '%s' "$prompt" >&2
-  IFS= read -r -s value
-  printf '\n' >&2
-  printf '%s' "$value"
-}
-
 compose=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --compose) compose="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
-  esac
-done
+case "${1:-}" in
+  --compose) compose="${2:?usage: $0 [--compose path]}" ;;
+  "" ) ;;
+  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "unknown argument: $1" >&2; exit 2 ;;
+esac
 
-username="$(ask 'USMS username / IC number or email (blank to keep as-is): ')"
-password="$(ask 'USMS password (blank to cancel): ')"
+printf 'USMS password (typing is not echoed): ' >&2
+IFS= read -rs pw || true          # a piped value may arrive without a trailing newline
+echo >&2
+[ -n "$pw" ] || { echo "nothing entered — no change made" >&2; exit 1; }
 
-if [ -z "$password" ] && [ -z "$username" ]; then
-  echo "nothing entered — no change made" >&2
-  exit 1
+if base64 --help 2>&1 | grep -q -- '-w'; then
+  enc=$(printf '%s' "$pw" | base64 -w0)
+else
+  enc=$(printf '%s' "$pw" | base64 | tr -d '\n')
 fi
 
-enc_password=""
-[ -n "$password" ] && enc_password="b64:$(b64 "$password")"
-
-# ---------------------------------------------------------------- print mode
 if [ -z "$compose" ]; then
-  echo "# ── paste these into the usms-scrape service's environment: ──"
-  echo
-  [ -n "$username" ] && echo "      - USMS_USERNAME=$username"
-  if [ -n "$enc_password" ]; then
-    echo "      - USMS_PASSWORD=$enc_password"
-    echo "        # ${#password} characters, dollar signs included"
-  fi
-  echo
-  echo "# ── one form only: delete any other USMS_PASSWORD / *_B64 / *_FILE line ──"
+  cat <<EOF
+
+Paste into the usms-scrape service's environment:
+
+  - USMS_PASSWORD=${enc}
+
+Then:  docker compose up -d --force-recreate usms-scrape
+Check: docker compose logs usms-scrape | head -3    →    password=*** (${#pw} chars, b64)
+EOF
   exit 0
 fi
 
-# ------------------------------------------------------- in-place rewrite mode
 [ -f "$compose" ] || { echo "ERROR: $compose not found" >&2; exit 1; }
-
 backup="$compose.bak-cred-$(date +%Y%m%d-%H%M%S)"
 cp -p "$compose" "$backup"
 
-python3 - "$compose" "$username" "$enc_password" "$backup" <<'PY'
+python3 - "$compose" "$enc" <<'PY'
 import re
 import sys
 
-path, username, enc_password, backup = sys.argv[1:5]
+path, enc = sys.argv[1:3]
 text = open(path, encoding="utf-8").read()
-original = text
-changed = []
+before = text
 
+text = re.sub(r"^(\s*-\s*USMS_PASSWORD\s*=).*$", lambda m: m.group(1) + enc, text, flags=re.M)
+text = re.sub(r"^(\s*USMS_PASSWORD\s*:\s*).*$", lambda m: m.group(1) + enc, text, flags=re.M)
 
-def replace_value(text, var, value):
-    pattern = re.compile(r"^(\s*-\s*%s\s*=)(.*)$" % var, re.M)
-    if pattern.search(text):
-        return pattern.sub(lambda m: m.group(1) + value, text), "list"
-    pattern = re.compile(r"^(\s*%s\s*:\s*)(.*)$" % var, re.M)
-    if pattern.search(text):
-        return pattern.sub(lambda m: m.group(1) + value, text), "map"
-    return text, None
-
-
-for var, value in (("USMS_USERNAME", username), ("USMS_PASSWORD", enc_password)):
-    if not value:
-        continue
-    text, form = replace_value(text, var, value)
-    changed.append("%s (%s form)" % (var, form) if form
-                   else "%s — NOT FOUND, add it manually" % var)
-
-removed = []
+# drop the variables this version no longer reads, so an old line cannot confuse anyone
 for var in ("USMS_PASSWORD_B64", "USMS_USERNAME_B64",
             "USMS_PASSWORD_FILE", "USMS_USERNAME_FILE"):
-    new = re.sub(r"^\s*-\s*%s=.*\r?\n" % var, "", text, flags=re.M)
-    new = re.sub(r"^\s*%s\s*:.*\r?\n" % var, "", new, flags=re.M)
-    if new != text:
-        removed.append(var)
-        text = new
+    text = re.sub(r"^\s*-?\s*%s[:=].*\r?\n" % var, "", text, flags=re.M)
 
-if text == original:
-    print("no change written")
+if "USMS_PASSWORD" not in text:
+    print("ERROR: no USMS_PASSWORD line in %s — add:\n  - USMS_PASSWORD=%s" % (path, enc))
+    sys.exit(1)
+if text == before:
+    print("no change needed")
     sys.exit(1)
 
 open(path, "w", encoding="utf-8").write(text)
 print("rewrote %s" % path)
-for line in changed:
-    print("  set %s" % line)
-for line in removed:
-    print("  removed competing %s line" % line)
-print("  backup: %s" % backup)
 PY
 
-echo
+echo "backup: $backup"
 echo "NEXT: docker compose up -d --force-recreate usms-scrape"
-echo "The first log line should read 'password=*** (N chars, b64)' with the right N,"
-echo "and 'login successful' should follow."
-echo "To undo:  mv '$backup' '$compose'"
+echo "Undo: mv '$backup' '$compose'"
