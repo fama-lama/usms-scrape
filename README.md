@@ -37,7 +37,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 
 | Variable         | Description                                                                                     | Required | Default       |
 |------------------|-------------------------------------------------------------------------------------------------|----------|---------------|
-| `USMS_USERNAME`  | Account username — IC number (digits) or email. Accepts plain or base64        | Yes | N/A |
+| `USMS_USERNAME`  | Account username — the IC number, digits only (no dashes or spaces)             | Yes | N/A |
 | `USMS_PASSWORD`  | Account password — **plain or base64 in the same variable**, detected automatically; plain breaks if it contains `$` | Yes | N/A |
 | `USMS_USERNAME_FILE` | Path to a file holding the username — only if you want nothing at all in the compose file | No | N/A |
 | `USMS_PASSWORD_FILE` | Path to a file holding the password — the form that keeps the secret out of the compose file | No | N/A |
@@ -58,7 +58,10 @@ per-request debug records contain the account password and IC number.
 
 ### Credentials
 
-Two cases. That is the whole story.
+The username is the **IC number, digits only** (no dashes, no spaces).
+
+The password is accepted in **two forms — plain or base64 — and the scraper detects which
+one it got**. You never tell it which. Only one case needs action:
 
 #### 1. Your password has no `$` in it
 
@@ -117,6 +120,10 @@ part of the Output line — paste the whole thing.
 
 That is it. No file, no mount, no `$$` escaping.
 
+**Why encoding is needed at all:** Compose deletes the `$...` part before the container
+starts, so the scraper receives a shortened password and cannot reconstruct it — no image
+can. That is the one thing it cannot fix for you; everything after it is automatic.
+
 #### Other ways to do it (all optional)
 
 | Instead of the website | How | When |
@@ -145,7 +152,7 @@ Notes that save time later:
   | `USMS_PASSWORD: 'MyP@ss$w0rd'` | `MyP@ss` |
 
 - **The username** is the IC number (digits only, no dashes or spaces) or the account's
-  email address; anything else is flagged at startup.
+  digit typos are flagged at startup.
 - Base64 is encoding, not encryption — anyone who can read your compose file can decode
   it. If that matters, use the file form.
 
@@ -402,7 +409,7 @@ two startup lines: `config: … password=*** (N chars)` and either
 | The portal page in the log shows **`Incorrect user name and password`** | The container is sending a different password than the portal expects. Compose truncation is the usual cause, a changed password the second. | Compare `(N chars)` with the real password length. `$` present → `$$` or `USMS_PASSWORD_FILE`. |
 | `the USMS portal REJECTED the credentials` then `Waiting for the credentials to be corrected` | The username/password the container holds are wrong. The scraper parks instead of retrying, to avoid locking the account. | Read the printed lengths, fix the value (base64 form survives `$`), then `up -d --force-recreate`. |
 | `the credential looks like base64 and was decoded automatically` | Not an error unless the password is literally base64-shaped. | Prefix the value with `plain:` to keep it literal. |
-| `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The username has dashes, spaces or a typo. | Enter the IC as digits only, or the account's email address. |
+| `USMS_USERNAME=… is neither a plain IC number (digits) nor an email address` | The IC has dashes, spaces or a typo. | Enter the IC as digits only, e.g. `01234567`. |
 | `CRITICAL config: USMS_PASSWORD is empty` then `Refusing to start` | The value arrived empty. A password that **starts** with `$` is emptied entirely by Compose. | Same fix. The process exits with code 2, so `restart: unless-stopped` shows a restart loop — that loop is the symptom. |
 | `USMS_PASSWORD_B64 is not valid base64 …` then `CRITICAL … could not be decoded` | The encoded value was truncated, or something other than base64 was pasted. | Re-run `./encode-credentials.sh` and paste the printed line verbatim. |
 | `both USMS_PASSWORD and USMS_PASSWORD_B64 are set — using the USMS_PASSWORD_B64 value` | Not an error: two routes were configured and the encoded one won. | Delete the plain line. |
@@ -578,7 +585,7 @@ digits are masked in logs only.
   generator with an in-file comment header, quote stripping, a warning when the
   password contains `$`, a warning when BOTH routes are set (the environment wins),
   the password length and source in the startup line, a username shape check (IC digits
-  or email), and — when the portal rejects the credentials — a full diagnosis plus a
+  digits only), and — when the portal rejects the credentials — a full diagnosis plus a
   stop-all-attempts park, so a wrong password can no longer lock the account.
 - **MQTT discovery** for multi-meter and water-only accounts: HA creates the sensors
   and a device per meter itself. Deliberately skipped for a single electricity meter,
