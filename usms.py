@@ -1103,6 +1103,79 @@ def _publish_meter(client, meter, cycle_id, prefix="home/usms"):
     return got
 
 
+# ---------------------------------------------------------------------------
+# Home Assistant MQTT discovery
+#
+# The per-meter topic branches are new, so nothing in HA knows about them. Rather
+# than requiring hand-written YAML on every Home Assistant that consumes them,
+# the scraper publishes retained discovery configs — HA's MQTT integration then
+# creates the entities itself, for exactly the meters this account has.
+#
+# Skipped for a SINGLE electricity meter on purpose: those setups already have
+# hand-written sensors bound to the legacy `home/usms/*` topics, and discovery
+# would add a duplicate set beside them.
+# ---------------------------------------------------------------------------
+
+DISCOVERY_PREFIX = "homeassistant"
+
+# (topic suffix, display label, icon, extra config)
+_DISCOVERY_FIELDS = (
+    ("remaining_unit", "Remaining unit", "mdi:counter", {}),
+    ("remaining_balance", "Remaining balance", "mdi:cash", {}),
+    ("meter_last_polled", "Meter last polled", "mdi:calendar-clock", {}),
+    ("meter_no", "Meter number", "mdi:information-outline", {"entity_category": "diagnostic"}),
+    ("status", "Status", "mdi:cloud-check-outline", {"entity_category": "diagnostic"}),
+)
+
+
+def discovery_wanted(meters):
+    """True when this account needs self-installing entities."""
+    if not meters:
+        return False
+    if len(meters) > 1:
+        return True
+    return (meters[0].get("kind") or "meter") != "electricity"
+
+
+def _discovery_payload(meter, slug, suffix, label, icon, extra):
+    kind = (meter.get("kind") or "meter").capitalize()
+    payload = {
+        "name": "USMS %s %s" % (kind, label),
+        "unique_id": "usms_%s_%s" % (slug, suffix),
+        "state_topic": "home/usms/%s/%s" % (slug, suffix),
+        "qos": 1,
+        "icon": icon,
+        "device": {
+            "identifiers": ["usms_meter_%s" % slug],
+            "name": "USMS %s meter" % kind,
+            "manufacturer": "USMS Brunei",
+            "model": "Smart meter",
+        },
+    }
+    if meter.get("meter_no"):
+        payload["device"]["serial_number"] = meter["meter_no"]
+    payload.update(extra)
+    return payload
+
+
+def publish_discovery(client, meters, cycle_id="none"):
+    """Retained discovery configs for every per-meter branch. Counts successes."""
+    if not discovery_wanted(meters):
+        log.debug("cycle=%s discovery not needed for this account", cycle_id)
+        return 0
+
+    published = 0
+    for meter, slug in zip(meters, _meter_topic_slugs(meters)):
+        for suffix, label, icon, extra in _DISCOVERY_FIELDS:
+            topic = "%s/sensor/usms_%s_%s/config" % (DISCOVERY_PREFIX, slug, suffix)
+            payload = json.dumps(_discovery_payload(meter, slug, suffix, label, icon, extra))
+            if _publish_topic(client, topic, payload, cycle_id):
+                published += 1
+    log.info("cycle=%s published %d discovery config(s) for %d meter(s)",
+             cycle_id, published, len(meters))
+    return published
+
+
 def publish_mqtt(meters, run_time, cycle_id="none"):
     """Publish what validated. True only when EVERY meter completed cleanly.
 
@@ -1140,6 +1213,11 @@ def publish_mqtt(meters, run_time, cycle_id="none"):
                   cycle_id, mqtt_broker, mqtt_port, rc, "offline")
 
         client.loop_start()
+
+        discovery_published = publish_discovery(client, meters, cycle_id)
+        if discovery_wanted(meters):
+            expected = len(meters) * len(_DISCOVERY_FIELDS)
+            published["discovery"] = discovery_published == expected
 
         if len(meters) > 1:
             for meter, slug in zip(meters, _meter_topic_slugs(meters)):

@@ -21,6 +21,7 @@ Only works for smart meters registered with https://www.usms.com.bn/smartmeter/i
 - **Auto-heal**: Any 3 consecutive failed cycles (portal, captcha, Selenium — not just `N/A` results) exit the container so Docker's `restart: unless-stopped` recycles it cleanly
 - **Value checks**: Every field is shape-checked (a reading with its unit — `… kWh` or `… m³` —, an amount, `dd/mm/yyyy`) before it is published — a shifted table row becomes a warning instead of silently publishing the wrong cell
 - **Multi-meter accounts**: Every meter card on the dashboard is read — electricity, water or both — each published under its own `home/usms/<type>/…` topics, with the classic topics following the electricity meter so existing dashboards keep working
+- **Self-installing Home Assistant entities**: For multi-meter (or water-only) accounts the scraper also publishes retained MQTT discovery configs, so HA creates the per-meter sensors and device itself — no YAML to copy
 - **Credential handling**: `USMS_PASSWORD_FILE` / `USMS_USERNAME_FILE` for passwords Docker Compose would mangle (it interpolates `$` away and passes quotes through literally), plus startup warnings that name the problem instead of failing the login
 - **Retained + QoS 1**: Publishes are retained, so a Home Assistant restart recovers the last values instantly; `home/usms/status` (`ok` / `partial` / `fail`, plus an `offline` last-will) reports scraper health
 - **Debug friendly**: Logs page title, URL and a digit-masked body preview on failure, saves the full page to `/tmp` for layout work, and ends every cycle with one greppable line —
@@ -110,6 +111,23 @@ first card if there is no electricity meter), so an existing Home Assistant setu
 keeps working without changes. Two meters of the same type get the meter number
 appended instead — `home/usms/electricity_55000001/…`. `status` at the top level is
 `ok` only when every meter came back complete.
+
+### Home Assistant entities (MQTT discovery)
+
+For any account that needs the new branches — more than one meter, or a single
+meter that is not electricity — the scraper publishes retained **MQTT discovery**
+configs, so Home Assistant creates the entities itself and no YAML is needed:
+
+- per meter: `sensor.usms_<meter>_remaining_unit`, `_remaining_balance`,
+  `_meter_last_polled`, plus diagnostic `_meter_no` and `_status`
+- `<meter>` is `water` / `electricity`, or `electricity_<meter_no>` when two meters
+  share a type
+- all sit under one HA device per meter, prefixed `USMS`
+
+Discovery is deliberately **not** published for a single electricity meter: those
+installations already have hand-written sensors on the legacy topics, and discovery
+would add a duplicate set next to them. Requires `MQTT_BROKER` (discovery travels on
+the same connection) and HA's MQTT integration.
 
 All topics are published with `retain=True, qos=1`, so a subscriber that starts late still
 receives the last values. A field that fails validation is simply not published — the
