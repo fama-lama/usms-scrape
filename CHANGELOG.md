@@ -3,6 +3,14 @@
 All notable changes to the USMS scraper. Versions are tagged `vX.Y.Z` and published to
 Docker Hub as `vX.Y.Z`, `stable` and `latest`.
 
+## Unreleased
+
+### Docs
+- **README header and logo.** `docs/assets/banner.{svg,png}` for the header and
+  `logo.{svg,png}` for the icon: the official USMS mark with a diagonal whiteout stripe
+  across it carrying the word `SCRAPE`, next to a plain `USMS-SCRAPE` banner. Documentation
+  only — no code, image or runtime change.
+
 ## v0.15.16
 
 ### Fixed

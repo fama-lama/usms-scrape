@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/banner.png" alt="usms-scrape — USMS smart meter scraper for Home Assistant" width="100%">
+</p>
+
 # USMS Scraper BRUNEI
 
 ![version](https://img.shields.io/badge/image-famalama%2Fusms--scrape-blue)
@@ -576,3 +580,13 @@ digits are masked in logs only.
 ## License
 
 This project is licensed under the GNU General Public License v3.0 (GPLv3). See LICENSE for details.
+
+## Credits
+
+<p align="left"><img src="docs/assets/logo.png" alt="usms-scrape logo" width="104"></p>
+
+Artwork in `docs/assets/` was made for this project. The USMS mark is the property of the
+Unified Smart Metering System (USMS), Brunei Darussalam; it is adapted here (a whiteout stripe
+reading `SCRAPE` over the original lettering) only to identify the portal this scraper reads.
+This project is unofficial and not affiliated with or endorsed by USMS.
+
